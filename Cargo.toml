@@ -1,0 +1,34 @@
+[package]
+name = "cadalloc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["William Wu <williamwutq@gmail.com>", "Claude <claude@anthropic.com>"]
+license = "MIT"
+description = "A minimal, configurable, embeddable allocator with segregated free lists for multithreaded environments"
+readme = "README.md"
+repository = "https://github.com/williamwutq/cadalloc"
+documentation = "https://docs.rs/cadalloc"
+keywords = ["allocator", "memory", "segregated-free-list", "no_std", "embedded"]
+categories = ["memory-management", "no-std", "concurrency"]
+
+# `changelog` is not a Cargo manifest key; setting it at package level emits
+# "unused manifest key" on every invocation. `[package.metadata]` is the
+# sanctioned home for custom data and is ignored silently.
+[package.metadata]
+changelog = "CHANGELOG.md"
+
+# Safe default: a copied template cannot be published by accident.
+# Delete this line when the crate is genuinely meant for crates.io.
+publish = false
+
+[dependencies]
+
+[lints.rust]
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+# Uncomment for a stricter crate. Expect to silence some of these individually.
+# pedantic = { level = "warn", priority = -1 }
