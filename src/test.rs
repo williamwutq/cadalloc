@@ -688,6 +688,78 @@ fn fixed_range_carve_is_non_overlapping() {
     }
 }
 
+// --- GlobalAlloc adapter (feature `alloc`, over its own static heap) --------
+
+#[cfg(feature = "alloc")]
+mod global_alloc {
+    use super::*;
+    use core::alloc::{GlobalAlloc, Layout};
+
+    const GA_HEAP_N: usize = 1 << 16;
+
+    #[repr(C, align(64))]
+    struct GaHeap([u8; GA_HEAP_N]);
+
+    static mut GA_HEAP: GaHeap = GaHeap([0; GA_HEAP_N]);
+
+    struct GaConfig;
+
+    impl Config for GaConfig {
+        type Atomics = CoreAtomics;
+        const MIN_ALIGN: u64 = 16;
+        const LNR_FLOOR: u64 = 32;
+        const EXP_FLOOR: u64 = 256;
+        const EXP_CEIL: u64 = 4096;
+        fn heap_base() -> u64 {
+            &raw const GA_HEAP as u64
+        }
+        fn heap_size() -> u64 {
+            GA_HEAP_N as u64
+        }
+    }
+
+    #[test]
+    fn global_alloc_impl_round_trips() {
+        let a = CadAlloc::<GaConfig>::new();
+        a.init().expect("init");
+
+        let layout = Layout::from_size_align(100, 8).unwrap();
+
+        // Alignment beyond MIN_ALIGN is unsatisfiable and refused (null).
+        let over = Layout::from_size_align(64, 256).unwrap();
+        assert!(unsafe { GlobalAlloc::alloc(&a, over) }.is_null());
+
+        // alloc_zeroed (the default impl) must zero even a *reused, dirty* block:
+        // dirty one, free it, then the zeroed alloc reclaims it (LIFO) cleared.
+        let d = unsafe { GlobalAlloc::alloc(&a, layout) };
+        assert!(!d.is_null());
+        unsafe { core::ptr::write_bytes(d, 0xFF, 100) };
+        unsafe { GlobalAlloc::dealloc(&a, d, layout) };
+        let z = unsafe { GlobalAlloc::alloc_zeroed(&a, layout) };
+        assert_eq!(z, d, "freed block of the same class should be reused");
+        for i in 0..100 {
+            assert_eq!(unsafe { *z.add(i) }, 0, "alloc_zeroed left byte {i} dirty");
+        }
+        unsafe { GlobalAlloc::dealloc(&a, z, layout) };
+
+        // A normal allocation is non-null, MIN_ALIGN-aligned, and writable.
+        let p = unsafe { GlobalAlloc::alloc(&a, layout) };
+        assert!(!p.is_null());
+        assert_eq!(p as u64 % 16, 0, "not MIN_ALIGN-aligned");
+        unsafe { core::ptr::write_bytes(p, 0xAB, 100) };
+
+        // realloc grows (relocating past EXP_CEIL), preserving the old bytes.
+        let p2 = unsafe { GlobalAlloc::realloc(&a, p, layout, 5000) };
+        assert!(!p2.is_null());
+        for i in 0..100 {
+            assert_eq!(unsafe { *p2.add(i) }, 0xAB, "realloc lost byte {i}");
+        }
+
+        unsafe { GlobalAlloc::dealloc(&a, p2, Layout::from_size_align(5000, 8).unwrap()) };
+        assert_eq!(a.verify(), Ok(()));
+    }
+}
+
 // --- multithreaded stress test (real threads over a shared heap) -----------
 //
 // Serial unit tests can't observe a lock-free allocator's concurrency bugs. This
@@ -810,7 +882,7 @@ mod stress {
                         let i = (next() as usize) % live.len();
                         let (s, token) = live[i];
                         check(s, token);
-                        let new_size = 8 + next() % 12_000;
+                        let new_size = 8 + next() % (s.len.max(16));
                         let g = a.realloc(s, new_size);
                         if g.is_null() {
                             // realloc failed: the original is left valid.

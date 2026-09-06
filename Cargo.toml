@@ -11,6 +11,7 @@ repository = "https://github.com/williamwutq/cadalloc"
 documentation = "https://docs.rs/cadalloc"
 keywords = ["allocator", "memory", "segregated-free-list", "no_std", "embedded"]
 categories = ["memory-management", "no-std", "concurrency"]
+publish = false
 
 # `changelog` is not a Cargo manifest key; setting it at package level emits
 # "unused manifest key" on every invocation. `[package.metadata]` is the
@@ -18,9 +19,13 @@ categories = ["memory-management", "no-std", "concurrency"]
 [package.metadata]
 changelog = "CHANGELOG.md"
 
-# Safe default: a copied template cannot be published by accident.
-# Delete this line when the crate is genuinely meant for crates.io.
-publish = false
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+# Implement `core::alloc::GlobalAlloc` for `CadAlloc<C>` (see the `global`
+# module). Off by default; enable to use cadalloc as a `#[global_allocator]`.
+alloc = []
 
 [dependencies]
 

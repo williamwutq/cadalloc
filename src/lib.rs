@@ -35,8 +35,15 @@
 //! ```
 //!
 //! See the [`config`] module for the size-class scheme and the heap-region
-//! accessors, and the [`atomic`] module for the atomic contract. The allocator
-//! core that consumes a `Config` is still being built out.
+//! accessors, the [`atomic`] module for the atomic contract, and the
+//! [`allocator`] module for the [`CadAlloc`] core.
+//!
+//! # Features
+//!
+//! - `alloc` *(off by default)* — implements [`core::alloc::GlobalAlloc`] for
+//!   [`CadAlloc`], so a configuration can serve as a program's
+//!   `#[global_allocator]`. See the `global` module (built with the feature)
+//!   for the alignment and initialization caveats.
 
 #![no_std]
 
@@ -49,6 +56,8 @@ pub mod allocator;
 pub mod atomic;
 pub mod config;
 pub mod ffi;
+#[cfg(feature = "alloc")]
+pub mod global;
 pub mod slice;
 
 pub use allocator::{CadAlloc, InitError, VerifyError};
