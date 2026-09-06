@@ -62,6 +62,28 @@ fn core_atomics_round_trip() {
         assert_eq!(CoreAtomics::atomic_swap(addr, 7), 20);
         assert_eq!(CoreAtomics::atomic_dec(addr), 7);
         assert_eq!(CoreAtomics::atomic_load(addr), 6);
+
+        // Bitwise fetch operations return the previous value.
+        CoreAtomics::atomic_store(addr, 0b1010);
+        assert_eq!(CoreAtomics::atomic_or(addr, 0b0100), 0b1010);
+        assert_eq!(CoreAtomics::atomic_load(addr), 0b1110);
+        assert_eq!(CoreAtomics::atomic_and(addr, 0b1100), 0b1110);
+        assert_eq!(CoreAtomics::atomic_load(addr), 0b1100);
+
+        // Weak CAS: loop to absorb spurious failure (single-threaded, so the
+        // read is always the current value and only spurious failure retries).
+        loop {
+            let (read, ok) = CoreAtomics::atomic_cas_weak(addr, 0b1100, 42);
+            assert_eq!(read, 0b1100);
+            if ok {
+                break;
+            }
+        }
+        assert_eq!(CoreAtomics::atomic_load(addr), 42);
+        // A mismatched expected value fails (never spuriously succeeds).
+        let (read, ok) = CoreAtomics::atomic_cas_weak(addr, 999, 0);
+        assert!(!ok);
+        assert_eq!(read, 42);
     }
 }
 

@@ -25,9 +25,16 @@
 //!
 //! Only three operations are fundamental: [`atomic_load`](Atomics::atomic_load),
 //! [`atomic_store`](Atomics::atomic_store), and
-//! [`atomic_cas`](Atomics::atomic_cas). The remaining five have default
-//! implementations built from a compare-and-swap loop. Override them when the
-//! target has a cheaper native instruction (`fetch_add`, `swap`, …).
+//! [`atomic_cas`](Atomics::atomic_cas). Everything else has a default built on
+//! those — the read-modify-write helpers as compare-and-swap loops, and
+//! [`atomic_cas_weak`](Atomics::atomic_cas_weak) as the strong `atomic_cas`.
+//! Override any of them when the target has a cheaper native instruction
+//! (`fetch_add`, `swap`, `fetch_and`/`fetch_or`, a weak `compare_exchange`, …).
+//!
+//! Providing a real [`atomic_cas_weak`](Atomics::atomic_cas_weak) is worthwhile
+//! on load-linked/store-conditional targets (ARM, RISC-V): the allocator's
+//! internal CAS loops already tolerate spurious failure, so a weak
+//! compare-exchange avoids the extra masking a strong one needs there.
 
 /// Atomic operations on 64-bit words at raw addresses.
 ///
@@ -61,6 +68,29 @@ pub trait Atomics {
     /// See [`atomic_load`](Atomics::atomic_load).
     unsafe fn atomic_cas(addr: u64, current: u64, new: u64) -> u64;
 
+    /// Weak atomic compare-and-swap.
+    ///
+    /// Like [`atomic_cas`](Atomics::atomic_cas), but permitted to fail
+    /// *spuriously* — that is, to report failure even when the word equals
+    /// `current` — which lets load-linked/store-conditional targets skip the
+    /// masking a strong compare-exchange needs. Returns `(read, success)`: the
+    /// value read before the attempt, and whether the store happened. On a
+    /// spurious failure `read` equals `current`. Only ever call this in a retry
+    /// loop.
+    ///
+    /// The default forwards to the strong [`atomic_cas`](Atomics::atomic_cas)
+    /// (which never fails spuriously); override it where a weak
+    /// `compare_exchange` is cheaper.
+    ///
+    /// # Safety
+    ///
+    /// See [`atomic_load`](Atomics::atomic_load).
+    #[inline]
+    unsafe fn atomic_cas_weak(addr: u64, current: u64, new: u64) -> (u64, bool) {
+        let read = unsafe { Self::atomic_cas(addr, current, new) };
+        (read, read == current)
+    }
+
     /// Atomically stores `val` and returns the previous value.
     ///
     /// # Safety
@@ -70,7 +100,7 @@ pub trait Atomics {
     unsafe fn atomic_swap(addr: u64, val: u64) -> u64 {
         loop {
             let cur = unsafe { Self::atomic_load(addr) };
-            if unsafe { Self::atomic_cas(addr, cur, val) } == cur {
+            if unsafe { Self::atomic_cas_weak(addr, cur, val) }.1 {
                 return cur;
             }
         }
@@ -86,7 +116,7 @@ pub trait Atomics {
         loop {
             let cur = unsafe { Self::atomic_load(addr) };
             let new = cur.wrapping_add(val);
-            if unsafe { Self::atomic_cas(addr, cur, new) } == cur {
+            if unsafe { Self::atomic_cas_weak(addr, cur, new) }.1 {
                 return cur;
             }
         }
@@ -102,7 +132,37 @@ pub trait Atomics {
         loop {
             let cur = unsafe { Self::atomic_load(addr) };
             let new = cur.wrapping_sub(val);
-            if unsafe { Self::atomic_cas(addr, cur, new) } == cur {
+            if unsafe { Self::atomic_cas_weak(addr, cur, new) }.1 {
+                return cur;
+            }
+        }
+    }
+
+    /// Atomically ANDs `val` into the word and returns the previous value.
+    ///
+    /// # Safety
+    ///
+    /// See [`atomic_load`](Atomics::atomic_load).
+    #[inline]
+    unsafe fn atomic_and(addr: u64, val: u64) -> u64 {
+        loop {
+            let cur = unsafe { Self::atomic_load(addr) };
+            if unsafe { Self::atomic_cas_weak(addr, cur, cur & val) }.1 {
+                return cur;
+            }
+        }
+    }
+
+    /// Atomically ORs `val` into the word and returns the previous value.
+    ///
+    /// # Safety
+    ///
+    /// See [`atomic_load`](Atomics::atomic_load).
+    #[inline]
+    unsafe fn atomic_or(addr: u64, val: u64) -> u64 {
+        loop {
+            let cur = unsafe { Self::atomic_load(addr) };
+            if unsafe { Self::atomic_cas_weak(addr, cur, cur | val) }.1 {
                 return cur;
             }
         }
@@ -182,6 +242,15 @@ impl Atomics for CoreAtomics {
     }
 
     #[inline(always)]
+    unsafe fn atomic_cas_weak(addr: u64, current: u64, new: u64) -> (u64, bool) {
+        use core::sync::atomic::Ordering::SeqCst;
+        match unsafe { Self::at(addr) }.compare_exchange_weak(current, new, SeqCst, SeqCst) {
+            Ok(prev) => (prev, true),
+            Err(prev) => (prev, false),
+        }
+    }
+
+    #[inline(always)]
     unsafe fn atomic_swap(addr: u64, val: u64) -> u64 {
         unsafe { Self::at(addr) }.swap(val, core::sync::atomic::Ordering::SeqCst)
     }
@@ -194,5 +263,15 @@ impl Atomics for CoreAtomics {
     #[inline(always)]
     unsafe fn atomic_sub(addr: u64, val: u64) -> u64 {
         unsafe { Self::at(addr) }.fetch_sub(val, core::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[inline(always)]
+    unsafe fn atomic_and(addr: u64, val: u64) -> u64 {
+        unsafe { Self::at(addr) }.fetch_and(val, core::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[inline(always)]
+    unsafe fn atomic_or(addr: u64, val: u64) -> u64 {
+        unsafe { Self::at(addr) }.fetch_or(val, core::sync::atomic::Ordering::SeqCst)
     }
 }

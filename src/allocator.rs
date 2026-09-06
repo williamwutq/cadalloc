@@ -319,10 +319,13 @@ impl<C: Config> Allocator<C> {
         unsafe { C::Atomics::atomic_store(addr, val) }
     }
 
+    /// Weak compare-and-swap, returning whether the store succeeded. Only valid
+    /// inside a retry loop (may fail spuriously). Every CAS in the allocator
+    /// sits in such a loop, so the weak form is always the right one.
     #[inline(always)]
-    fn cas(&self, addr: u64, current: u64, new: u64) -> u64 {
+    fn cas_weak(&self, addr: u64, current: u64, new: u64) -> bool {
         // SAFETY: see `load`.
-        unsafe { C::Atomics::atomic_cas(addr, current, new) }
+        unsafe { C::Atomics::atomic_cas_weak(addr, current, new) }.1
     }
 
     // --- refill lock -------------------------------------------------------
@@ -330,7 +333,7 @@ impl<C: Config> Allocator<C> {
     #[inline]
     fn lock(&self) {
         let addr = self.lock_addr();
-        while self.cas(addr, 0, 1) != 0 {
+        while !self.cas_weak(addr, 0, 1) {
             spin_loop();
         }
     }
@@ -353,7 +356,7 @@ impl<C: Config> Allocator<C> {
             let old_addr = old & !mask;
             let new_tag = (old + 1) & mask;
             self.store(block + 8, old_addr); // block.next = current head
-            if self.cas(head, old, block | new_tag) == old {
+            if self.cas_weak(head, old, block | new_tag) {
                 return;
             }
         }
@@ -374,7 +377,7 @@ impl<C: Config> Allocator<C> {
             // padding, never user payload, so the read is always in-bounds.
             let next = self.load(old_addr + 8);
             let new_tag = (old + 1) & mask;
-            if self.cas(head, old, next | new_tag) == old {
+            if self.cas_weak(head, old, next | new_tag) {
                 return old_addr;
             }
         }

@@ -19,10 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   via `assert_config_valid` and the `Config::VALIDATE` associated constant.
 - `const_heap_base` / `const_heap_size` free functions for reading the
   compile-time heap region in `const` contexts.
-- `Atomics` trait defining the eight required atomic operations (`atomic_load`,
-  `atomic_store`, `atomic_cas`, `atomic_swap`, `atomic_inc`, `atomic_dec`,
-  `atomic_add`, `atomic_sub`), with default compare-and-swap-loop
-  implementations for the derived operations.
+- `Atomics` trait defining the atomic operations the allocator needs:
+  `atomic_load`, `atomic_store`, `atomic_cas`, `atomic_cas_weak`, `atomic_swap`,
+  `atomic_inc`, `atomic_dec`, `atomic_add`, `atomic_sub`, `atomic_and`, and
+  `atomic_or`. Only `atomic_load`/`atomic_store`/`atomic_cas` are required; the
+  rest default to `atomic_cas`-based implementations (`atomic_cas_weak` to the
+  strong CAS). The allocator's internal retry loops use the weak CAS, which a
+  load-linked/store-conditional backend (ARM, RISC-V) can implement more
+  cheaply.
 - `CoreAtomics`, an `AtomicU64`-based backend gated on
   `target_has_atomic = "64"`.
 - Statically-computed bin counts on `Config` (`NUM_LINEAR`, `NUM_EXP`,
