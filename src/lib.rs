@@ -46,7 +46,7 @@ pub mod config;
 pub mod ffi;
 pub mod slice;
 
-pub use allocator::{Allocator, InitError, VerifyError};
+pub use allocator::{CadAlloc, InitError, VerifyError};
 pub use atomic::Atomics;
 #[cfg(target_has_atomic = "64")]
 pub use atomic::CoreAtomics;
@@ -76,18 +76,6 @@ macro_rules! pow2 {
     ($n:expr) => {
         1u64 << ($n)
     };
-}
-
-/// Returns the version of this crate, as recorded in `Cargo.toml`.
-///
-/// # Examples
-///
-/// ```
-/// assert!(!cadalloc::version().is_empty());
-/// ```
-#[must_use]
-pub fn version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
 }
 
 #[cfg(test)]

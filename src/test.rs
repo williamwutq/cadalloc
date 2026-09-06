@@ -22,11 +22,6 @@ impl Config for TestConfig {
 const _: () = assert_config_valid::<TestConfig>();
 
 #[test]
-fn version_is_reported() {
-    assert_eq!(version(), env!("CARGO_PKG_VERSION"));
-}
-
-#[test]
 fn const_heap_accessors_read_compile_time_values() {
     assert_eq!(const_heap_base::<TestConfig>(), 0x1_0000);
     assert_eq!(const_heap_size::<TestConfig>(), 0x10_0000);
@@ -96,7 +91,7 @@ fn bin_counts_are_statically_computed() {
     assert_eq!(TestConfig::NUM_LINEAR, 15);
     assert_eq!(TestConfig::NUM_EXP, 17);
     assert_eq!(TestConfig::NUM_BINS, 33);
-    assert_eq!(Allocator::<TestConfig>::bin_count(), 33);
+    assert_eq!(CadAlloc::<TestConfig>::bin_count(), 33);
 }
 
 #[test]
@@ -208,7 +203,7 @@ impl Config for MismatchConfig {
 
 #[test]
 fn allocator_alloc_free_reuse() {
-    let a = Allocator::<HeapConfig>::new();
+    let a = CadAlloc::<HeapConfig>::new();
 
     // A pristine (zeroed) heap has no marker.
     assert_eq!(a.verify(), Err(VerifyError::BadMagic));
@@ -217,10 +212,10 @@ fn allocator_alloc_free_reuse() {
 
     // After init the marker and fingerprint check out...
     assert_eq!(a.verify(), Ok(()));
-    assert_eq!(Allocator::<HeapConfig>::magic(), MAGIC_LE);
+    assert_eq!(CadAlloc::<HeapConfig>::magic(), MAGIC_LE);
     // ...but a different configuration is rejected.
     assert_eq!(
-        Allocator::<MismatchConfig>::new().verify(),
+        CadAlloc::<MismatchConfig>::new().verify(),
         Err(VerifyError::ConfigMismatch)
     );
 
@@ -280,7 +275,7 @@ fn init_rejects_bad_heap() {
         }
     }
     assert_eq!(
-        Allocator::<Misaligned>::new().init(),
+        CadAlloc::<Misaligned>::new().init(),
         Err(InitError::MisalignedHeap)
     );
 
@@ -298,10 +293,7 @@ fn init_rejects_bad_heap() {
             16 // far too small for the control region
         }
     }
-    assert_eq!(
-        Allocator::<Tiny>::new().init(),
-        Err(InitError::HeapTooSmall)
-    );
+    assert_eq!(CadAlloc::<Tiny>::new().init(), Err(InitError::HeapTooSmall));
 }
 
 // --- FFI export shims (over their own static heap) -------------------------

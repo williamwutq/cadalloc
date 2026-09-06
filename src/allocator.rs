@@ -3,7 +3,7 @@
 //!
 //! # Layout
 //!
-//! An [`Allocator`] is stateless — a zero-sized marker for a [`Config`]. All
+//! A [`CadAlloc`] is stateless — a zero-sized marker for a [`Config`]. All
 //! mutable state lives in the managed heap, in a *control region* at its base,
 //! followed by the payload area blocks are carved from:
 //!
@@ -17,7 +17,7 @@
 //!
 //! The heap opens with two metadata words: the `"CADALLOC"` marker (8 ASCII
 //! bytes, little-endian) and a 64-bit fingerprint of the configuration, both
-//! checked by [`verify`](Allocator::verify). Each bin head is a `u64`: the
+//! checked by [`verify`](CadAlloc::verify). Each bin head is a `u64`: the
 //! address of the first free block in that bin (`0` when empty), with the low
 //! alignment bits used as an ABA tag for the lock-free bins. The last bin
 //! (`NUM_BINS - 1`) is the oversized bin.
@@ -45,8 +45,8 @@
 //! The private `load` / `store` / `cas` helpers all assume their address names a
 //! live, `MIN_ALIGN`-aligned `u64` inside the managed heap. Every internal call
 //! site upholds this by construction (control words and block headers computed
-//! from `heap_base`). [`free`](Allocator::free) trusts that the slice it is
-//! given was produced by [`alloc`](Allocator::alloc) on this allocator.
+//! from `heap_base`). [`free`](CadAlloc::free) trusts that the slice it is
+//! given was produced by [`alloc`](CadAlloc::alloc) on this allocator.
 
 use crate::atomic::Atomics;
 use crate::config::Config;
@@ -168,13 +168,13 @@ pub(crate) const fn bin_index<C: Config>(size: u64) -> u64 {
 /// The type is zero-sized: it carries no state of its own, only the `Config`
 /// that fixes the size classes, heap region, and atomics backend. All state
 /// lives in the managed heap. Because coordination is entirely through the
-/// [`Atomics`] backend, an `Allocator` may be shared across threads (for
-/// example as a `static`) once [`init`](Allocator::init) has run.
+/// [`Atomics`] backend, a `CadAlloc` may be shared across threads (for
+/// example as a `static`) once [`init`](CadAlloc::init) has run.
 ///
 /// # Usage
 ///
 /// ```no_run
-/// use cadalloc::{Allocator, Config, CoreAtomics};
+/// use cadalloc::{CadAlloc, Config, CoreAtomics};
 ///
 /// struct C;
 /// impl Config for C {
@@ -187,7 +187,7 @@ pub(crate) const fn bin_index<C: Config>(size: u64) -> u64 {
 ///     const HEAP_SIZE: u64 = 1 << 20;
 /// }
 ///
-/// let a = Allocator::<C>::new();
+/// let a = CadAlloc::<C>::new();
 /// a.init().unwrap();
 /// let s = a.alloc(100, 16);
 /// if !s.is_null() {
@@ -195,18 +195,18 @@ pub(crate) const fn bin_index<C: Config>(size: u64) -> u64 {
 ///     a.free(s);
 /// }
 /// ```
-pub struct Allocator<C: Config> {
+pub struct CadAlloc<C: Config> {
     _config: PhantomData<fn() -> C>,
 }
 
-impl<C: Config> Default for Allocator<C> {
+impl<C: Config> Default for CadAlloc<C> {
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Why [`Allocator::init`] could not prepare the heap.
+/// Why [`CadAlloc::init`] could not prepare the heap.
 ///
 /// `#[repr(i32)]`, so it is FFI-safe and each variant's discriminant is the
 /// status code the [`export_c_api!`](crate::export_c_api) `init` shim returns
@@ -220,7 +220,7 @@ pub enum InitError {
     HeapTooSmall = 2,
 }
 
-/// Why [`Allocator::verify`] rejected a heap.
+/// Why [`CadAlloc::verify`] rejected a heap.
 ///
 /// `#[repr(i32)]`, so it is FFI-safe and each variant's discriminant is the
 /// status code the [`export_c_api!`](crate::export_c_api) `verify` shim returns
@@ -237,8 +237,8 @@ pub enum VerifyError {
     ConfigMismatch = 2,
 }
 
-impl<C: Config> Allocator<C> {
-    /// Creates an allocator handle. Call [`init`](Allocator::init) once, before
+impl<C: Config> CadAlloc<C> {
+    /// Creates an allocator handle. Call [`init`](CadAlloc::init) once, before
     /// any allocation, to prepare the heap.
     #[must_use]
     #[inline]
@@ -393,7 +393,7 @@ impl<C: Config> Allocator<C> {
     }
 
     /// The compile-time fingerprint of this configuration's layout-defining
-    /// constants (see [`verify`](Allocator::verify)).
+    /// constants (see [`verify`](CadAlloc::verify)).
     #[must_use]
     #[inline]
     pub const fn config_hash() -> u64 {
@@ -432,8 +432,8 @@ impl<C: Config> Allocator<C> {
     /// matching configuration.
     ///
     /// Reads the marker and fingerprint words at the front of the heap and
-    /// compares them against [`magic`](Allocator::magic) and this
-    /// configuration's [`config_hash`](Allocator::config_hash). **Call this
+    /// compares them against [`magic`](CadAlloc::magic) and this
+    /// configuration's [`config_hash`](CadAlloc::config_hash). **Call this
     /// before touching a heap that some *other* build may have prepared** (for
     /// example a persistent or shared-memory region): running an allocator over
     /// a heap laid out by a different configuration corrupts memory silently,
@@ -478,7 +478,7 @@ impl<C: Config> Allocator<C> {
         Slice::new(block + C::MIN_ALIGN, bsize - C::MIN_ALIGN)
     }
 
-    /// Returns a block previously handed out by [`alloc`](Allocator::alloc) to
+    /// Returns a block previously handed out by [`alloc`](CadAlloc::alloc) to
     /// its bin. Freeing [`Slice::NULL`] is a no-op.
     ///
     /// The slice's `ptr` must be one returned by `alloc` on this allocator; its

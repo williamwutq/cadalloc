@@ -1,6 +1,6 @@
 //! Exporting a `cadalloc` allocator to C and other non-Rust callers.
 //!
-//! The public methods on [`Allocator`](crate::Allocator) are generic over the
+//! The public methods on [`CadAlloc`](crate::CadAlloc) are generic over the
 //! [`Config`](crate::Config), so they monomorphize to a distinct function per
 //! configuration and cannot themselves carry a stable, unmangled symbol name —
 //! `#[no_mangle]` does not apply to a generic function. To link from C you pick
@@ -134,7 +134,7 @@ macro_rules! export_c_api {
         /// discriminant (`1` misaligned, `2` too small).
         #[unsafe(no_mangle)]
         pub extern $abi fn $init() -> i32 {
-            match $crate::Allocator::<$config>::new().init() {
+            match $crate::CadAlloc::<$config>::new().init() {
                 Ok(()) => 0,
                 Err(e) => e as i32,
             }
@@ -144,14 +144,14 @@ macro_rules! export_c_api {
         /// slice, or the null slice (zero `ptr`) on failure.
         #[unsafe(no_mangle)]
         pub extern $abi fn $alloc(size: u64, align: u64) -> $crate::Slice {
-            $crate::Allocator::<$config>::new().alloc(size, align)
+            $crate::CadAlloc::<$config>::new().alloc(size, align)
         }
 
         /// Returns a block previously handed out by the matching `alloc`.
         /// Freeing the null slice is a no-op.
         #[unsafe(no_mangle)]
         pub extern $abi fn $free(block: $crate::Slice) {
-            $crate::Allocator::<$config>::new().free(block)
+            $crate::CadAlloc::<$config>::new().free(block)
         }
 
         /// Checks the heap marker and configuration fingerprint. Returns `0` on
@@ -159,7 +159,7 @@ macro_rules! export_c_api {
         /// configuration mismatch).
         #[unsafe(no_mangle)]
         pub extern $abi fn $verify() -> i32 {
-            match $crate::Allocator::<$config>::new().verify() {
+            match $crate::CadAlloc::<$config>::new().verify() {
                 Ok(()) => 0,
                 Err(e) => e as i32,
             }
