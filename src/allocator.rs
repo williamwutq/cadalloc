@@ -189,7 +189,7 @@ pub(crate) const fn bin_index<C: Config>(size: u64) -> u64 {
 ///
 /// let a = CadAlloc::<C>::new();
 /// a.init().unwrap();
-/// let s = a.alloc(100, 16);
+/// let s = a.alloc(100);
 /// if !s.is_null() {
 ///     // ... use [s.ptr, s.ptr + s.len) ...
 ///     a.free(s);
@@ -246,13 +246,6 @@ impl<C: Config> CadAlloc<C> {
         Self {
             _config: PhantomData,
         }
-    }
-
-    /// The total number of bins for this configuration (statically known).
-    #[must_use]
-    #[inline]
-    pub const fn bin_count() -> u64 {
-        C::NUM_BINS
     }
 
     // --- control-region geometry -------------------------------------------
@@ -318,11 +311,14 @@ impl<C: Config> CadAlloc<C> {
     }
 
     /// The address alignment required of a block in `bin`: `MIN_ALIGN` for linear
-    /// and oversized bins, and half the octave base (`2^(n-1)` for octave `2^n`)
-    /// for exponential bins, never below `MIN_ALIGN`.
+    /// bins, half the octave base (`2^(n-1)` for octave `2^n`) for exponential
+    /// bins, and `EXP_CEIL` for the oversized bin (its octave, `2^(c+1)`, aligns
+    /// to `2^c`); never below `MIN_ALIGN`.
     #[inline]
     const fn align_of_bin(bin: u64) -> u64 {
-        if bin >= C::NUM_LINEAR && bin < C::NUM_LINEAR + C::NUM_EXP {
+        if bin < C::NUM_LINEAR {
+            C::MIN_ALIGN
+        } else if bin < C::NUM_LINEAR + C::NUM_EXP {
             let octave = (bin - C::NUM_LINEAR) / 2;
             let base_log2 = C::EXP_FLOOR.ilog2() as u64 + octave;
             let align = 1u64 << (base_log2 - 1);
@@ -332,7 +328,7 @@ impl<C: Config> CadAlloc<C> {
                 align
             }
         } else {
-            C::MIN_ALIGN
+            C::EXP_CEIL
         }
     }
 
@@ -495,27 +491,15 @@ impl<C: Config> CadAlloc<C> {
         }
     }
 
-    /// Returns `true` if `align` is unsupported (not a power of two, or larger
-    /// than `MIN_ALIGN`, which is all this pass handles).
-    #[inline]
-    const fn bad_align(align: u64) -> bool {
-        align > C::MIN_ALIGN || (align > 1 && !align.is_power_of_two())
-    }
-
-    /// Allocates a block with at least `size` payload bytes and the given
-    /// `align`, returning a [`Slice`] over its payload, or [`Slice::NULL`] on
-    /// failure.
+    /// Allocates a block with at least `size` payload bytes, `MIN_ALIGN`-aligned,
+    /// returning a [`Slice`] over its payload, or [`Slice::NULL`] on failure.
     ///
-    /// `align` must be a power of two no greater than `MIN_ALIGN` (the payload
-    /// is always `MIN_ALIGN`-aligned); larger alignments are not yet supported
-    /// and return the null slice. The returned slice's `len` is the block's full
-    /// usable capacity, which may exceed `size`.
+    /// The returned slice's `len` is the block's full usable capacity, which may
+    /// exceed `size`. The payload is always `MIN_ALIGN`-aligned; stronger
+    /// alignments are not currently supported.
     #[must_use]
     #[inline]
-    pub fn alloc(&self, size: u64, align: u64) -> Slice {
-        if Self::bad_align(align) {
-            return Slice::NULL;
-        }
+    pub fn alloc(&self, size: u64) -> Slice {
         let need = align_up(size, C::MIN_ALIGN) + C::MIN_ALIGN; // + header
         let bin = bin_index::<C>(need);
         let block = if bin == Self::oversize_bin() {
@@ -533,8 +517,8 @@ impl<C: Config> CadAlloc<C> {
     /// Returns a block previously handed out by [`alloc`](CadAlloc::alloc) to
     /// its bin. Freeing [`Slice::NULL`] is a no-op.
     ///
-    /// The slice's `ptr` must be one returned by `alloc` on this allocator; its
-    /// `len` is ignored (the true size is read from the block header).
+    /// The slice's `ptr` must be one returned by this allocator; its `len` is
+    /// ignored (the true size is read from the block header).
     #[inline]
     pub fn free(&self, block: Slice) {
         if block.is_null() {
@@ -555,9 +539,9 @@ impl<C: Config> CadAlloc<C> {
         }
     }
 
-    /// Resizes `block` to hold at least `new_size` payload bytes, returning a
-    /// [`Slice`] over the result (possibly the same address, possibly moved), or
-    /// [`Slice::NULL`] on failure.
+    /// Resizes `block` to hold at least `new_size` payload bytes, `MIN_ALIGN`-
+    /// aligned, returning a [`Slice`] over the result (possibly the same address,
+    /// possibly moved), or [`Slice::NULL`] on failure.
     ///
     /// Follows C `realloc` conventions: reallocating [`Slice::NULL`] is
     /// equivalent to [`alloc`](CadAlloc::alloc), and on failure the original
@@ -567,15 +551,10 @@ impl<C: Config> CadAlloc<C> {
     /// place, splitting off the tail only when the leftover is worth it (the
     /// `SPLIT_MIN` / `CARVE_MAX` rule, so with the default `SPLIT_MIN` a shrink
     /// within the fixed classes just keeps the block and its slack).
-    ///
-    /// `align` carries the same restriction as [`alloc`](CadAlloc::alloc).
     #[inline]
-    pub fn realloc(&self, block: Slice, new_size: u64, align: u64) -> Slice {
+    pub fn realloc(&self, block: Slice, new_size: u64) -> Slice {
         if block.is_null() {
-            return self.alloc(new_size, align);
-        }
-        if Self::bad_align(align) {
-            return Slice::NULL;
+            return self.alloc(new_size);
         }
 
         let hdr = block.ptr - C::MIN_ALIGN;
@@ -595,25 +574,29 @@ impl<C: Config> CadAlloc<C> {
         }
 
         // Grow: relocate. Allocate first so a failure leaves the original valid.
-        let dst = self.alloc(new_size, align);
+        self.relocate(block, cur_size - C::MIN_ALIGN, self.alloc(new_size))
+    }
+
+    /// Copies `src`'s first `src_usable` payload bytes into `dst`, frees `src`,
+    /// and returns `dst` — the shared tail of every relocating path. A null
+    /// `dst` (allocation failed) leaves `src` untouched and returns the null
+    /// slice, per C `realloc`.
+    #[inline]
+    fn relocate(&self, src: Slice, src_usable: u64, dst: Slice) -> Slice {
         if dst.is_null() {
             return Slice::NULL;
         }
-        let copy_len = {
-            let old = cur_size - C::MIN_ALIGN;
-            if old < dst.len { old } else { dst.len }
+        let copy = if src_usable < dst.len {
+            src_usable
+        } else {
+            dst.len
         };
-        // SAFETY: `block` and `dst` are distinct, caller-owned payloads, each
-        // valid for `copy_len` bytes; the block being resized is not touched
-        // concurrently.
+        // SAFETY: `src` and `dst` are distinct, caller-owned payloads, each valid
+        // for `copy` bytes; neither is accessed concurrently.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                block.ptr as *const u8,
-                dst.ptr as *mut u8,
-                copy_len as usize,
-            );
+            core::ptr::copy_nonoverlapping(src.ptr as *const u8, dst.ptr as *mut u8, copy as usize);
         }
-        self.free(block);
+        self.free(src);
         dst
     }
 
@@ -672,29 +655,60 @@ impl<C: Config> CadAlloc<C> {
     }
 
     /// The largest block that can be carved off ending at address `end` from a
-    /// region of `len` bytes: `(size, bin)`, or `(0, 0)` if nothing fits.
+    /// region of `len` bytes: `(size, bin)`, or `(0, 0)` if nothing fits. The
+    /// placement `end - size` meets the class alignment (`align | end`, since
+    /// the class size is a multiple of its alignment).
     ///
-    /// A region `> EXP_CEIL` yields one oversized block spanning all of it. A
-    /// smaller region yields the largest fixed class `<= len` whose alignment
-    /// the placement `end - size` satisfies (equivalently `align | end`, since
-    /// the class size is a multiple of its alignment). Alignment is
-    /// non-increasing as the bin shrinks and bin 0 requires only `MIN_ALIGN`
-    /// (always met, as `end` is `MIN_ALIGN`-aligned), so the search terminates.
+    /// A region `> EXP_CEIL` yields one oversized block, aligned to `EXP_CEIL`:
+    /// its start is `end - size` rounded up to that alignment, and the
+    /// misaligned prefix is left for the next carve. If that rounding would
+    /// shrink the block into the fixed range, the region is carved as fixed
+    /// classes instead.
+    ///
+    /// Otherwise the class is bounded by both `len` and alignment, computed in
+    /// O(1): alignment constrains only exponential classes (linear ones need
+    /// just `MIN_ALIGN`, which an already-`MIN_ALIGN`-aligned `end` has). An
+    /// exponential class `V` is aligned to `2^(floor(log2 V) - 1)`, which
+    /// divides `end` iff it is `<= 1 << end.trailing_zeros()`; the largest such
+    /// class is therefore `3 * (1 << end.trailing_zeros())`.
     #[inline]
-    const fn largest_carvable(end: u64, len: u64) -> (u64, u64) {
+    pub(crate) const fn largest_carvable(end: u64, len: u64) -> (u64, u64) {
         if len < C::LNR_FLOOR {
             return (0, 0);
         }
+        // Oversized: align the block start to `EXP_CEIL`. `end - len` is the
+        // region base and never underflows (the region lies in the heap).
+        let mut cap = len;
         if len > C::EXP_CEIL {
-            return (len, Self::oversize_bin());
-        }
-        let mut bin = Self::floor_bin(len);
-        while (end & (Self::align_of_bin(bin) - 1)) != 0 {
-            if bin == 0 {
-                return (0, 0);
+            let start = align_up(end - len, C::EXP_CEIL);
+            let size = end - start;
+            if size > C::EXP_CEIL {
+                return (size, Self::oversize_bin());
             }
-            bin -= 1;
+            // Rounding dropped it into the fixed range; carve fixed classes.
+            cap = C::EXP_CEIL;
         }
+        let limit = if cap < C::EXP_FLOOR {
+            // Linear target: alignment does not bind.
+            cap
+        } else {
+            let exp_cap = 3 * (1u64 << end.trailing_zeros());
+            if cap < exp_cap {
+                cap
+            } else if exp_cap >= C::EXP_FLOOR {
+                exp_cap
+            } else {
+                // No exponential class is aligned at `end`; fall back to the
+                // largest linear class, which is always aligned.
+                C::EXP_FLOOR - C::MIN_ALIGN
+            }
+        };
+        if limit < C::LNR_FLOOR {
+            // Degenerate config with no linear classes and alignment excluding
+            // every exponential class.
+            return (0, 0);
+        }
+        let bin = Self::floor_bin(limit);
         (bin_class::<C>(bin), bin)
     }
 
@@ -793,14 +807,16 @@ impl<C: Config> CadAlloc<C> {
             self.split_and_free_tail(chosen, bsize, need);
             chosen
         } else {
-            // Bump a fresh block of exactly `need`.
+            // Bump a fresh block, aligned to EXP_CEIL; free the resulting gap.
             let bump = self.load(self.bump_addr());
-            if bump + need > self.heap_end() {
+            let aligned = align_up(bump, C::EXP_CEIL);
+            if aligned + need > self.heap_end() {
                 0
             } else {
-                self.store(self.bump_addr(), bump + need);
-                self.store(bump, pack(need, USED));
-                bump
+                self.carve_gap(bump, aligned);
+                self.store(self.bump_addr(), aligned + need);
+                self.store(aligned, pack(need, USED));
+                aligned
             }
         };
 

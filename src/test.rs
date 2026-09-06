@@ -91,7 +91,6 @@ fn bin_counts_are_statically_computed() {
     assert_eq!(TestConfig::NUM_LINEAR, 15);
     assert_eq!(TestConfig::NUM_EXP, 17);
     assert_eq!(TestConfig::NUM_BINS, 33);
-    assert_eq!(CadAlloc::<TestConfig>::bin_count(), 33);
 }
 
 #[test]
@@ -144,6 +143,75 @@ fn bin_index_always_fits() {
     // Above EXP_CEIL is the oversized bin.
     assert_eq!(bin_index::<TestConfig>(65537), TestConfig::NUM_BINS - 1);
     assert_eq!(bin_index::<TestConfig>(1 << 30), TestConfig::NUM_BINS - 1);
+}
+
+#[test]
+fn largest_carvable_matches_brute_force() {
+    type C = TestConfig; // MIN=16, LNR=16, EXP_FLOOR=256, EXP_CEIL=65536
+
+    fn align_up(x: u64, a: u64) -> u64 {
+        (x + (a - 1)) & !(a - 1)
+    }
+    // The alignment a class of size `v` demands (mirrors `align_of_bin`).
+    fn class_align(v: u64) -> u64 {
+        if v < C::EXP_FLOOR {
+            C::MIN_ALIGN
+        } else {
+            let a = 1u64 << (v.ilog2() - 1);
+            if a < C::MIN_ALIGN { C::MIN_ALIGN } else { a }
+        }
+    }
+    // Ground truth: a region past EXP_CEIL is one oversized block aligned to
+    // EXP_CEIL (falling back to fixed if that rounding shrinks it into the fixed
+    // range); otherwise the largest fixed class fitting `len` and aligned at
+    // `end`.
+    fn reference(end: u64, len: u64) -> u64 {
+        let mut cap = len;
+        if len > C::EXP_CEIL {
+            let size = end - align_up(end - len, C::EXP_CEIL);
+            if size > C::EXP_CEIL {
+                return size;
+            }
+            cap = C::EXP_CEIL;
+        }
+        let mut best = 0;
+        let fixed = C::NUM_BINS - 1;
+        let mut bin = 0;
+        while bin < fixed {
+            let c = bin_class::<C>(bin);
+            if c <= cap && end % class_align(c) == 0 && c > best {
+                best = c;
+            }
+            bin += 1;
+        }
+        best
+    }
+
+    for ez in 4..21u32 {
+        // Three addresses whose largest power-of-two divisor is exactly 2^ez,
+        // kept well above the largest tested `len` so `end - len` is valid.
+        for m in 0..3u64 {
+            let end = ((2 * m + 1) + (1u64 << 20)) << ez;
+            for &len in &[
+                1u64, 16, 100, 240, 255, 256, 300, 500, 768, 1000, 2048, 3000, 4096, 6144, 60000,
+                65536, 70000, 200000,
+            ] {
+                let (size, bin) = CadAlloc::<C>::largest_carvable(end, len);
+                let expected = reference(end, len);
+                assert_eq!(size, expected, "end={end:#x} len={len}: size mismatch");
+                if size == 0 {
+                    continue;
+                }
+                if bin == C::NUM_BINS - 1 {
+                    assert!(size > C::EXP_CEIL, "oversized bin holds a small block");
+                    assert_eq!((end - size) % C::EXP_CEIL, 0, "oversized misaligned");
+                } else {
+                    assert_eq!(bin_class::<C>(bin), size, "bin/size disagree");
+                    assert_eq!(end % class_align(size), 0, "carved block misaligned");
+                }
+            }
+        }
+    }
 }
 
 // --- allocator integration test (over a real static heap) ------------------
@@ -220,13 +288,13 @@ fn allocator_alloc_free_reuse() {
     );
 
     // Basic fixed-class allocation.
-    let s1 = a.alloc(100, 16);
+    let s1 = a.alloc(100);
     assert!(!s1.is_null());
     assert_eq!(s1.ptr % 16, 0, "payload must be MIN_ALIGN-aligned");
     assert!(s1.len >= 100, "capacity {} < requested 100", s1.len);
 
     // A second allocation must not overlap the first.
-    let s2 = a.alloc(100, 16);
+    let s2 = a.alloc(100);
     assert!(!s2.is_null());
     assert_ne!(s1.ptr, s2.ptr);
     assert!(
@@ -237,25 +305,22 @@ fn allocator_alloc_free_reuse() {
     // Freeing then re-allocating the same class reuses the block (LIFO).
     let p1 = s1.ptr;
     a.free(s1);
-    let s3 = a.alloc(100, 16);
+    let s3 = a.alloc(100);
     assert_eq!(s3.ptr, p1, "freed block should be reused");
 
     a.free(s2);
     a.free(s3);
 
     // Oversized path: > EXP_CEIL (4096).
-    let big = a.alloc(5000, 16);
+    let big = a.alloc(5000);
     assert!(!big.is_null());
     assert!(big.len >= 5000);
     let bp = big.ptr;
     a.free(big);
     // First-fit on the oversized list should recover the same block.
-    let big2 = a.alloc(5000, 16);
+    let big2 = a.alloc(5000);
     assert_eq!(big2.ptr, bp, "oversized block should be reused");
     a.free(big2);
-
-    // Alignment beyond MIN_ALIGN is not yet supported.
-    assert!(a.alloc(16, 32).is_null());
 }
 
 #[test]
@@ -339,28 +404,25 @@ fn ffi_shims_round_trip() {
     assert_eq!(cadtest_init(), 0);
     assert_eq!(cadtest_verify(), 0);
 
-    let s = cadtest_alloc(100, 16);
+    let s = cadtest_alloc(100);
     assert!(!s.is_null());
     assert!(s.len >= 100);
     cadtest_free(s);
 
     // Reuse after free (LIFO), exercising both alloc and free shims.
-    let s2 = cadtest_alloc(100, 16);
+    let s2 = cadtest_alloc(100);
     assert_eq!(s2.ptr, s.ptr);
 
     // realloc shim: grow, then free through the shim.
-    let s3 = cadtest_realloc(s2, 2000, 16);
+    let s3 = cadtest_realloc(s2, 2000);
     assert!(!s3.is_null());
     assert!(s3.len >= 2000);
     cadtest_free(s3);
 
     // realloc(NULL, ...) behaves like alloc.
-    let s4 = cadtest_realloc(Slice::NULL, 64, 16);
+    let s4 = cadtest_realloc(Slice::NULL, 64);
     assert!(!s4.is_null());
     cadtest_free(s4);
-
-    // Alignment beyond MIN_ALIGN returns the null slice.
-    assert!(cadtest_alloc(16, 32).is_null());
 }
 
 // --- realloc (over its own static heap) ------------------------------------
@@ -396,12 +458,12 @@ fn realloc_grows_shrinks_relocates() {
     a.init().expect("init");
 
     // realloc(NULL, ...) behaves like alloc.
-    let n = a.realloc(Slice::NULL, 50, 16);
+    let n = a.realloc(Slice::NULL, 50);
     assert!(!n.is_null());
     a.free(n);
 
     // Grow relocates and preserves the old contents.
-    let s = a.alloc(64, 16);
+    let s = a.alloc(64);
     assert!(!s.is_null());
     // SAFETY: `s.ptr` is a live 64-byte payload in our static heap.
     unsafe {
@@ -409,7 +471,7 @@ fn realloc_grows_shrinks_relocates() {
             (s.ptr as *mut u8).add(i as usize).write(i as u8);
         }
     }
-    let g = a.realloc(s, 2000, 16);
+    let g = a.realloc(s, 2000);
     assert!(!g.is_null());
     assert!(g.len >= 2000);
     // SAFETY: `g.ptr` holds the relocated payload.
@@ -422,25 +484,28 @@ fn realloc_grows_shrinks_relocates() {
 
     // Shrink within the fixed classes stays in place (default SPLIT_MIN keeps
     // the leftover as internal slack).
-    let f = a.alloc(2000, 16);
+    let f = a.alloc(2000);
     let cap = f.len;
-    let t = a.realloc(f, 100, 16);
+    let t = a.realloc(f, 100);
     assert_eq!(t.ptr, f.ptr, "fixed shrink should not move");
     assert_eq!(t.len, cap, "fixed shrink keeps the whole block");
     a.free(t);
 
-    // Oversized shrink splits off the tail, which becomes a reusable free block.
-    let big = a.alloc(12000, 16);
+    // Oversized shrink stays in place and shrinks; a follow-up allocation is
+    // valid and disjoint from the retained block.
+    let big = a.alloc(12000);
     assert!(big.len >= 12000);
-    let sh = a.realloc(big, 5000, 16);
+    let sh = a.realloc(big, 5000);
     assert_eq!(sh.ptr, big.ptr, "oversized shrink stays in place");
     assert!(sh.len >= 5000 && sh.len < big.len, "block actually shrank");
-    // The tail sits immediately after the shrunk front block and is recovered
-    // by the next oversized allocation (first-fit).
-    let reuse = a.alloc(6000, 16);
-    assert_eq!(reuse.ptr, big.ptr + sh.len + 16, "tail should be reused");
+    let other = a.alloc(3000);
+    assert!(!other.is_null());
+    assert!(
+        !overlap(sh, other),
+        "new allocation overlaps the retained block"
+    );
+    a.free(other);
     a.free(sh);
-    a.free(reuse);
 }
 
 // --- fixed-range multi-carve (SPLIT_MIN < EXP_CEIL) ------------------------
@@ -482,10 +547,14 @@ fn overlap(a: Slice, b: Slice) -> bool {
     a.ptr < b.ptr + b.len && b.ptr < a.ptr + a.len
 }
 
-#[repr(C, align(64))]
-struct AlignHeap([u8; HEAP_N]);
+// Larger than the shared HEAP_N so several oversized (> EXP_CEIL = 65536)
+// allocations, each with an up-to-EXP_CEIL alignment gap, fit.
+const ALIGN_HEAP_N: usize = 1 << 20;
 
-static mut ALIGN_HEAP: AlignHeap = AlignHeap([0; HEAP_N]);
+#[repr(C, align(64))]
+struct AlignHeap([u8; ALIGN_HEAP_N]);
+
+static mut ALIGN_HEAP: AlignHeap = AlignHeap([0; ALIGN_HEAP_N]);
 
 fn align_heap_base() -> u64 {
     &raw const ALIGN_HEAP as u64
@@ -503,7 +572,7 @@ impl Config for AlignConfig {
         align_heap_base()
     }
     fn heap_size() -> u64 {
-        HEAP_N as u64
+        ALIGN_HEAP_N as u64
     }
 }
 
@@ -515,7 +584,7 @@ fn bump_aligns_exponential_blocks() {
     // Each exponential block's header must sit on its class alignment: half the
     // octave base (`2^(n-1)` for a block in the `2^n` octave).
     for &sz in &[300u64, 500, 2000, 5000, 9000] {
-        let s = a.alloc(sz, 16);
+        let s = a.alloc(sz);
         assert!(!s.is_null());
         let header = s.ptr - 16; // block start
         let class = s.len + 16; // class-exact block size
@@ -528,6 +597,20 @@ fn bump_aligns_exponential_blocks() {
         );
         a.free(s);
     }
+
+    // Oversized blocks (> EXP_CEIL) align to EXP_CEIL.
+    for &sz in &[70_000u64, 100_000, 200_000] {
+        let s = a.alloc(sz);
+        assert!(!s.is_null());
+        assert!(s.len + 16 > AlignConfig::EXP_CEIL, "not oversized");
+        assert_eq!(
+            (s.ptr - 16) % AlignConfig::EXP_CEIL,
+            0,
+            "oversized header {:#x} not EXP_CEIL-aligned",
+            s.ptr - 16
+        );
+        a.free(s);
+    }
 }
 
 #[test]
@@ -537,9 +620,9 @@ fn fixed_range_carve_is_non_overlapping() {
 
     // A max-class (4096) block shrunk to a small class leaves a ~3968-byte
     // fixed-range excess, which is carved into class-exact free blocks.
-    let big = a.alloc(4080, 16);
+    let big = a.alloc(4080);
     assert!(!big.is_null());
-    let small = a.realloc(big, 100, 16);
+    let small = a.realloc(big, 100);
     assert_eq!(small.ptr, big.ptr, "shrink stays in place");
     assert!(small.len >= 100 && small.len < 4080, "block shrank");
 
@@ -552,7 +635,7 @@ fn fixed_range_carve_is_non_overlapping() {
     live[0] = small;
     for k in 1..live.len() {
         let sz = 16 + (k as u64 % 6) * 130;
-        let s = a.alloc(sz, 16);
+        let s = a.alloc(sz);
         assert!(!s.is_null(), "alloc {k} failed");
         assert_eq!(s.ptr % 16, 0, "payload misaligned");
         assert!(s.ptr >= heap_lo && s.ptr + s.len <= heap_hi, "out of heap");

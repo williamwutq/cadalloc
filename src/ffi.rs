@@ -11,11 +11,11 @@
 //!
 //! - [`Slice`](crate::Slice) is `#[repr(C)]` — `struct { uint64_t ptr, len; }` —
 //!   and is passed and returned by value.
-//! - `alloc(size, align) -> Slice` returns [`Slice::NULL`](crate::Slice::NULL)
+//! - `alloc(size) -> Slice` returns [`Slice::NULL`](crate::Slice::NULL)
 //!   (a zero `ptr`) on failure.
-//! - `realloc(Slice, new_size, align) -> Slice` returns the resized payload, or
-//!   the null slice on failure (leaving the original valid); a null input acts
-//!   like `alloc`.
+//! - `realloc(Slice, new_size) -> Slice` returns the resized payload, or the
+//!   null slice on failure (leaving the original valid); a null input acts like
+//!   `alloc`.
 //! - `free(Slice)` returns nothing; freeing the null slice is a no-op.
 //! - `init() -> int32_t` and `verify() -> int32_t` return `0` on success, or a
 //!   positive code otherwise:
@@ -148,19 +148,19 @@ macro_rules! export_c_api {
             }
         }
 
-        /// Allocates `size` bytes with `align` alignment. Returns the payload
+        /// Allocates `size` bytes (`MIN_ALIGN`-aligned). Returns the payload
         /// slice, or the null slice (zero `ptr`) on failure.
         #[unsafe(no_mangle)]
-        pub extern $abi fn $alloc(size: u64, align: u64) -> $crate::Slice {
-            $crate::CadAlloc::<$config>::new().alloc(size, align)
+        pub extern $abi fn $alloc(size: u64) -> $crate::Slice {
+            $crate::CadAlloc::<$config>::new().alloc(size)
         }
 
-        /// Resizes `block` to `new_size` bytes with `align` alignment. Returns
-        /// the (possibly moved) payload slice, or the null slice on failure
-        /// (the original block is left valid). A null `block` acts like `alloc`.
+        /// Resizes `block` to `new_size` bytes. Returns the (possibly moved)
+        /// payload slice, or the null slice on failure (the original block is
+        /// left valid). A null `block` acts like `alloc`.
         #[unsafe(no_mangle)]
-        pub extern $abi fn $realloc(block: $crate::Slice, new_size: u64, align: u64) -> $crate::Slice {
-            $crate::CadAlloc::<$config>::new().realloc(block, new_size, align)
+        pub extern $abi fn $realloc(block: $crate::Slice, new_size: u64) -> $crate::Slice {
+            $crate::CadAlloc::<$config>::new().realloc(block, new_size)
         }
 
         /// Returns a block previously handed out by the matching `alloc`.
