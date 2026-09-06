@@ -13,7 +13,7 @@
 //!     type Atomics = CoreAtomics;
 //!
 //!     const MIN_ALIGN: u64 = 16;
-//!     const LNR_FLOOR: u64 = 16;
+//!     const LNR_FLOOR: u64 = 32;
 //!     const EXP_FLOOR: u64 = 256;
 //!     const EXP_CEIL: u64 = 65536;
 //! }
@@ -60,7 +60,7 @@ use crate::atomic::Atomics;
 ///
 /// The four size constants plus `SPLIT_MIN` must all be **powers of two**, and
 /// they must satisfy
-/// `MIN_ALIGN <= LNR_FLOOR <= EXP_FLOOR <= EXP_CEIL`, `SPLIT_MIN <= EXP_CEIL`,
+/// `2 * MIN_ALIGN <= LNR_FLOOR <= EXP_FLOOR <= EXP_CEIL`, `SPLIT_MIN <= EXP_CEIL`,
 /// with `MIN_ALIGN > 8`. (`CARVE_MAX` is unconstrained.) These rules are checked
 /// at compile time by [`assert_config_valid`] and by the
 /// [`VALIDATE`](Config::VALIDATE) associated constant.
@@ -75,7 +75,9 @@ pub trait Config {
     /// classes. Must be a power of two greater than `2^3` (so, at least 16).
     const MIN_ALIGN: u64;
 
-    /// Smallest allocation class. Must be a power of two and `>= MIN_ALIGN`.
+    /// Smallest allocation class. Must be a power of two and `>= 2 * MIN_ALIGN`
+    /// (a block dedicates its first `MIN_ALIGN` bytes to the header, so a smaller
+    /// class would have an empty payload).
     const LNR_FLOOR: u64;
 
     /// Boundary between the linear and exponential regions. Must be a power of
@@ -164,8 +166,8 @@ pub trait Config {
     ///
     /// Evaluating this constant (which [`assert_config_valid`] forces) triggers
     /// a compile error if any constant is not a power of two or the ordering
-    /// `MIN_ALIGN > 8`, `MIN_ALIGN <= LNR_FLOOR <= EXP_FLOOR <= EXP_CEIL` does
-    /// not hold. There is no reason to reference this directly; call
+    /// `MIN_ALIGN > 8`, `2 * MIN_ALIGN <= LNR_FLOOR <= EXP_FLOOR <= EXP_CEIL`
+    /// does not hold. There is no reason to reference this directly; call
     /// [`assert_config_valid`] instead.
     const VALIDATE: () = {
         assert!(
@@ -181,8 +183,8 @@ pub trait Config {
             "[cadalloc config] LNR_FLOOR must be a power of two"
         );
         assert!(
-            Self::LNR_FLOOR >= Self::MIN_ALIGN,
-            "[cadalloc config] LNR_FLOOR must be >= MIN_ALIGN"
+            Self::LNR_FLOOR >= 2 * Self::MIN_ALIGN,
+            "[cadalloc config] LNR_FLOOR must be >= 2 * MIN_ALIGN (so the smallest class has a non-empty payload)"
         );
         assert!(
             Self::EXP_FLOOR.is_power_of_two(),
@@ -222,7 +224,7 @@ pub trait Config {
 /// # impl Config for MyConfig {
 /// #     type Atomics = CoreAtomics;
 /// #     const MIN_ALIGN: u64 = 16;
-/// #     const LNR_FLOOR: u64 = 16;
+/// #     const LNR_FLOOR: u64 = 32;
 /// #     const EXP_FLOOR: u64 = 256;
 /// #     const EXP_CEIL: u64 = 65536;
 /// # }

@@ -25,7 +25,7 @@
 //!     type Atomics = CoreAtomics;
 //!
 //!     const MIN_ALIGN: u64 = 16;    // min alignment & linear class step
-//!     const LNR_FLOOR: u64 = 16;    // smallest class
+//!     const LNR_FLOOR: u64 = 32;    // smallest class
 //!     const EXP_FLOOR: u64 = 256;   // linear -> exponential boundary
 //!     const EXP_CEIL: u64 = 65536;  // largest class; above spills oversized
 //! }

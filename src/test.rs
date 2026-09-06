@@ -10,7 +10,7 @@ impl Config for TestConfig {
     type Atomics = CoreAtomics;
 
     const MIN_ALIGN: u64 = 16;
-    const LNR_FLOOR: u64 = 16;
+    const LNR_FLOOR: u64 = 32;
     const EXP_FLOOR: u64 = 256;
     const EXP_CEIL: u64 = 65536;
 
@@ -86,11 +86,11 @@ fn core_atomics_round_trip() {
 
 #[test]
 fn bin_counts_are_statically_computed() {
-    // MIN_ALIGN=16, LNR_FLOOR=16, EXP_FLOOR=256, EXP_CEIL=65536:
-    // linear = (256-16)/16 = 15; exp = 2*(16-8)+1 = 17; +1 oversized = 33.
-    assert_eq!(TestConfig::NUM_LINEAR, 15);
+    // MIN_ALIGN=16, LNR_FLOOR=32, EXP_FLOOR=256, EXP_CEIL=65536:
+    // linear = (256-32)/16 = 14; exp = 2*(16-8)+1 = 17; +1 oversized = 32.
+    assert_eq!(TestConfig::NUM_LINEAR, 14);
     assert_eq!(TestConfig::NUM_EXP, 17);
-    assert_eq!(TestConfig::NUM_BINS, 33);
+    assert_eq!(TestConfig::NUM_BINS, 32);
 }
 
 #[test]
@@ -103,11 +103,11 @@ fn bin_classes_are_ordered_and_aligned() {
         assert_eq!(c % TestConfig::MIN_ALIGN, 0, "bin {k} class {c} misaligned");
         prev = c;
     }
-    // First/last known classes.
-    assert_eq!(bin_class::<TestConfig>(0), 16);
-    assert_eq!(bin_class::<TestConfig>(14), 240);
-    assert_eq!(bin_class::<TestConfig>(15), 256);
-    assert_eq!(bin_class::<TestConfig>(16), 384);
+    // First/last known classes (14 linear: bins 0..13 = 32..240; exp from bin 14).
+    assert_eq!(bin_class::<TestConfig>(0), 32);
+    assert_eq!(bin_class::<TestConfig>(13), 240);
+    assert_eq!(bin_class::<TestConfig>(14), 256);
+    assert_eq!(bin_class::<TestConfig>(15), 384);
     assert_eq!(bin_class::<TestConfig>(fixed - 1), 65536);
     assert_eq!(bin_class::<TestConfig>(fixed), u64::MAX); // oversized sentinel
 }
@@ -238,7 +238,7 @@ impl Config for HeapConfig {
     type Atomics = CoreAtomics;
 
     const MIN_ALIGN: u64 = 16;
-    const LNR_FLOOR: u64 = 16;
+    const LNR_FLOOR: u64 = 32;
     const EXP_FLOOR: u64 = 256;
     const EXP_CEIL: u64 = 4096;
 
@@ -258,7 +258,7 @@ struct MismatchConfig;
 impl Config for MismatchConfig {
     type Atomics = CoreAtomics;
     const MIN_ALIGN: u64 = 16;
-    const LNR_FLOOR: u64 = 16;
+    const LNR_FLOOR: u64 = 32;
     const EXP_FLOOR: u64 = 256;
     const EXP_CEIL: u64 = 8192; // differs from HeapConfig's 4096
     fn heap_base() -> u64 {
@@ -329,7 +329,7 @@ fn init_rejects_bad_heap() {
     impl Config for Misaligned {
         type Atomics = CoreAtomics;
         const MIN_ALIGN: u64 = 16;
-        const LNR_FLOOR: u64 = 16;
+        const LNR_FLOOR: u64 = 32;
         const EXP_FLOOR: u64 = 256;
         const EXP_CEIL: u64 = 4096;
         fn heap_base() -> u64 {
@@ -348,7 +348,7 @@ fn init_rejects_bad_heap() {
     impl Config for Tiny {
         type Atomics = CoreAtomics;
         const MIN_ALIGN: u64 = 16;
-        const LNR_FLOOR: u64 = 16;
+        const LNR_FLOOR: u64 = 32;
         const EXP_FLOOR: u64 = 256;
         const EXP_CEIL: u64 = 4096;
         fn heap_base() -> u64 {
@@ -377,7 +377,7 @@ struct FfiConfig;
 impl Config for FfiConfig {
     type Atomics = CoreAtomics;
     const MIN_ALIGN: u64 = 16;
-    const LNR_FLOOR: u64 = 16;
+    const LNR_FLOOR: u64 = 32;
     const EXP_FLOOR: u64 = 256;
     const EXP_CEIL: u64 = 4096;
     fn heap_base() -> u64 {
@@ -437,7 +437,7 @@ struct DfConfig;
 impl Config for DfConfig {
     type Atomics = CoreAtomics;
     const MIN_ALIGN: u64 = 16;
-    const LNR_FLOOR: u64 = 16;
+    const LNR_FLOOR: u64 = 32;
     const EXP_FLOOR: u64 = 256;
     const EXP_CEIL: u64 = 4096;
     fn heap_base() -> u64 {
@@ -478,7 +478,7 @@ struct ReallocConfig;
 impl Config for ReallocConfig {
     type Atomics = CoreAtomics;
     const MIN_ALIGN: u64 = 16;
-    const LNR_FLOOR: u64 = 16;
+    const LNR_FLOOR: u64 = 32;
     const EXP_FLOOR: u64 = 256;
     const EXP_CEIL: u64 = 4096;
     fn heap_base() -> u64 {
@@ -563,7 +563,7 @@ struct CarveConfig;
 impl Config for CarveConfig {
     type Atomics = CoreAtomics;
     const MIN_ALIGN: u64 = 16;
-    const LNR_FLOOR: u64 = 16;
+    const LNR_FLOOR: u64 = 32;
     const EXP_FLOOR: u64 = 256;
     const EXP_CEIL: u64 = 4096;
     const SPLIT_MIN: u64 = 256; // < EXP_CEIL: carve fixed-range excess
@@ -602,7 +602,7 @@ struct AlignConfig;
 impl Config for AlignConfig {
     type Atomics = CoreAtomics;
     const MIN_ALIGN: u64 = 16;
-    const LNR_FLOOR: u64 = 16;
+    const LNR_FLOOR: u64 = 32;
     const EXP_FLOOR: u64 = 256;
     const EXP_CEIL: u64 = 65536;
     fn heap_base() -> u64 {

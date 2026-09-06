@@ -192,7 +192,7 @@ pub(crate) const fn bin_index<C: Config>(size: u64) -> u64 {
 /// impl Config for C {
 ///     type Atomics = CoreAtomics;
 ///     const MIN_ALIGN: u64 = 16;
-///     const LNR_FLOOR: u64 = 16;
+///     const LNR_FLOOR: u64 = 32;
 ///     const EXP_FLOOR: u64 = 256;
 ///     const EXP_CEIL: u64 = 65536;
 ///     const HEAP_BASE: u64 = 0x2000_0000; // a real, mapped region

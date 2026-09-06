@@ -14,7 +14,7 @@ impl Config for ExampleConfig {
 
     // Size classes (all powers of two, MIN_ALIGN <= LNR <= EXP_FLOOR <= CEIL):
     const MIN_ALIGN: u64 = 16; // every allocation is 16-byte aligned
-    const LNR_FLOOR: u64 = 16; // smallest class, linear step of MIN_ALIGN
+    const LNR_FLOOR: u64 = 32; // smallest class, linear step of MIN_ALIGN
     const EXP_FLOOR: u64 = 256; // linear below here, exponential above
     const EXP_CEIL: u64 = 65536; // largest class; larger requests go oversized
 
