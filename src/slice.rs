@@ -32,12 +32,14 @@ impl Slice {
 
     /// Constructs a slice from a base address and a length.
     #[must_use]
+    #[inline(always)]
     pub const fn new(ptr: u64, len: u64) -> Self {
         Self { ptr, len }
     }
 
     /// Returns `true` if this is the [null slice](Slice::NULL) (base `0`).
     #[must_use]
+    #[inline(always)]
     pub const fn is_null(&self) -> bool {
         self.ptr == 0
     }
@@ -47,12 +49,14 @@ impl Slice {
     /// The addition is wrapping; a well-formed slice never wraps the address
     /// space, so a wrapped result indicates a malformed slice.
     #[must_use]
+    #[inline(always)]
     pub const fn end(&self) -> u64 {
         self.ptr.wrapping_add(self.len)
     }
 
     /// Returns `true` if `addr` lies within `[ptr, ptr + len)`.
     #[must_use]
+    #[inline(always)]
     pub const fn contains(&self, addr: u64) -> bool {
         addr >= self.ptr && addr < self.end()
     }

@@ -66,6 +66,7 @@ pub trait Atomics {
     /// # Safety
     ///
     /// See [`atomic_load`](Atomics::atomic_load).
+    #[inline]
     unsafe fn atomic_swap(addr: u64, val: u64) -> u64 {
         loop {
             let cur = unsafe { Self::atomic_load(addr) };
@@ -80,6 +81,7 @@ pub trait Atomics {
     /// # Safety
     ///
     /// See [`atomic_load`](Atomics::atomic_load).
+    #[inline]
     unsafe fn atomic_add(addr: u64, val: u64) -> u64 {
         loop {
             let cur = unsafe { Self::atomic_load(addr) };
@@ -95,6 +97,7 @@ pub trait Atomics {
     /// # Safety
     ///
     /// See [`atomic_load`](Atomics::atomic_load).
+    #[inline]
     unsafe fn atomic_sub(addr: u64, val: u64) -> u64 {
         loop {
             let cur = unsafe { Self::atomic_load(addr) };
@@ -111,6 +114,7 @@ pub trait Atomics {
     /// # Safety
     ///
     /// See [`atomic_load`](Atomics::atomic_load).
+    #[inline]
     unsafe fn atomic_inc(addr: u64) -> u64 {
         unsafe { Self::atomic_add(addr, 1) }
     }
@@ -121,6 +125,7 @@ pub trait Atomics {
     /// # Safety
     ///
     /// See [`atomic_load`](Atomics::atomic_load).
+    #[inline]
     unsafe fn atomic_dec(addr: u64) -> u64 {
         unsafe { Self::atomic_sub(addr, 1) }
     }
@@ -147,7 +152,7 @@ impl CoreAtomics {
     ///
     /// `addr` must be a valid, `AtomicU64`-aligned address that stays valid for
     /// the duration of the borrow.
-    #[inline]
+    #[inline(always)]
     unsafe fn at<'a>(addr: u64) -> &'a core::sync::atomic::AtomicU64 {
         // 64-bit target: `u64` -> `usize` is lossless.
         unsafe { &*(addr as usize as *const core::sync::atomic::AtomicU64) }
@@ -156,17 +161,17 @@ impl CoreAtomics {
 
 #[cfg(target_has_atomic = "64")]
 impl Atomics for CoreAtomics {
-    #[inline]
+    #[inline(always)]
     unsafe fn atomic_load(addr: u64) -> u64 {
         unsafe { Self::at(addr) }.load(core::sync::atomic::Ordering::SeqCst)
     }
 
-    #[inline]
+    #[inline(always)]
     unsafe fn atomic_store(addr: u64, val: u64) {
         unsafe { Self::at(addr) }.store(val, core::sync::atomic::Ordering::SeqCst);
     }
 
-    #[inline]
+    #[inline(always)]
     unsafe fn atomic_cas(addr: u64, current: u64, new: u64) -> u64 {
         use core::sync::atomic::Ordering::SeqCst;
         match unsafe { Self::at(addr) }.compare_exchange(current, new, SeqCst, SeqCst) {
@@ -176,17 +181,17 @@ impl Atomics for CoreAtomics {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     unsafe fn atomic_swap(addr: u64, val: u64) -> u64 {
         unsafe { Self::at(addr) }.swap(val, core::sync::atomic::Ordering::SeqCst)
     }
 
-    #[inline]
+    #[inline(always)]
     unsafe fn atomic_add(addr: u64, val: u64) -> u64 {
         unsafe { Self::at(addr) }.fetch_add(val, core::sync::atomic::Ordering::SeqCst)
     }
 
-    #[inline]
+    #[inline(always)]
     unsafe fn atomic_sub(addr: u64, val: u64) -> u64 {
         unsafe { Self::at(addr) }.fetch_sub(val, core::sync::atomic::Ordering::SeqCst)
     }
