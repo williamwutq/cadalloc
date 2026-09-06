@@ -106,6 +106,28 @@ pub trait Config {
     /// operation. Not required to be a power of two. Defaults to `2`.
     const CARVE_MAX: u64 = 2;
 
+    /// Number of linear size classes, computed statically from the size
+    /// constants: the classes `LNR_FLOOR, LNR_FLOOR + MIN_ALIGN, …` up to (but
+    /// not including) `EXP_FLOOR`, so `(EXP_FLOOR - LNR_FLOOR) / MIN_ALIGN`.
+    ///
+    /// This is a derived constant; do not override it.
+    const NUM_LINEAR: u64 = (Self::EXP_FLOOR - Self::LNR_FLOOR) / Self::MIN_ALIGN;
+
+    /// Number of exponential size classes, computed statically. Each power-of-two
+    /// octave from `EXP_FLOOR` to `EXP_CEIL` contributes two classes (`2^n` and
+    /// `3 * 2^(n-1)`), plus the terminating `EXP_CEIL` class itself:
+    /// `2 * (log2(EXP_CEIL) - log2(EXP_FLOOR)) + 1`.
+    ///
+    /// This is a derived constant; do not override it.
+    const NUM_EXP: u64 = 2 * (Self::EXP_CEIL.ilog2() as u64 - Self::EXP_FLOOR.ilog2() as u64) + 1;
+
+    /// Total number of bins, computed statically: the linear classes, the
+    /// exponential classes, and one terminal oversized bin
+    /// (`NUM_LINEAR + NUM_EXP + 1`).
+    ///
+    /// This is a derived constant; do not override it.
+    const NUM_BINS: u64 = Self::NUM_LINEAR + Self::NUM_EXP + 1;
+
     /// Compile-time base address of the managed heap, or `0` if the base is
     /// only known at runtime. Read by [`const_heap_base`] and, by default, by
     /// [`heap_base`](Config::heap_base).
@@ -121,6 +143,7 @@ pub trait Config {
     /// Defaults to the compile-time [`HEAP_BASE`](Config::HEAP_BASE). Override
     /// when the region is discovered at runtime.
     #[must_use]
+    #[inline]
     fn heap_base() -> u64 {
         Self::HEAP_BASE
     }
@@ -130,6 +153,7 @@ pub trait Config {
     /// Defaults to the compile-time [`HEAP_SIZE`](Config::HEAP_SIZE). Override
     /// when the region is discovered at runtime.
     #[must_use]
+    #[inline]
     fn heap_size() -> u64 {
         Self::HEAP_SIZE
     }
@@ -198,6 +222,7 @@ pub trait Config {
 /// # }
 /// const _: () = cadalloc::assert_config_valid::<MyConfig>();
 /// ```
+#[inline]
 pub const fn assert_config_valid<C: Config>() {
     C::VALIDATE
 }
@@ -207,6 +232,7 @@ pub const fn assert_config_valid<C: Config>() {
 /// This is [`Config::HEAP_BASE`]; it is `0` when the base is only known at
 /// runtime, in which case use [`Config::heap_base`] instead.
 #[must_use]
+#[inline]
 pub const fn const_heap_base<C: Config>() -> u64 {
     C::HEAP_BASE
 }
@@ -216,6 +242,7 @@ pub const fn const_heap_base<C: Config>() -> u64 {
 /// This is [`Config::HEAP_SIZE`]; it is `0` when the size is only known at
 /// runtime, in which case use [`Config::heap_size`] instead.
 #[must_use]
+#[inline]
 pub const fn const_heap_size<C: Config>() -> u64 {
     C::HEAP_SIZE
 }
