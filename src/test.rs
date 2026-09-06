@@ -32,7 +32,9 @@ fn const_heap_accessors_read_compile_time_values() {
 #[test]
 fn slice_null_and_bounds() {
     assert!(Slice::NULL.is_null());
-    let s = Slice::new(0x1000, 0x100);
+    // SAFETY: a fabricated slice used only for pure address arithmetic below;
+    // its bytes are never read, written, or handed to the allocator.
+    let s = unsafe { Slice::new(0x1000, 0x100) };
     assert!(!s.is_null());
     assert_eq!(s.end(), 0x1100);
     assert!(s.contains(0x1000));
@@ -683,5 +685,313 @@ fn fixed_range_carve_is_non_overlapping() {
     }
     for s in live {
         a.free(s);
+    }
+}
+
+// --- multithreaded stress test (real threads over a shared heap) -----------
+//
+// Serial unit tests can't observe a lock-free allocator's concurrency bugs. This
+// hammers one heap from many threads doing alloc/free/realloc churn and detects
+// corruption by fingerprinting: every live block is filled with a unique 64-bit
+// token, verified before it is freed or reallocated. Two overlapping live blocks
+// (a bad carve, a lost/duplicated free, an ABA slip) would clobber each other's
+// tokens and trip an assertion. Complements the `loom` model check below, which
+// is exhaustive but only over the isolated Treiber stack.
+#[cfg(not(loom))]
+mod stress {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::vec::Vec;
+
+    const STRESS_HEAP_N: usize = 16 << 20; // 16 MiB
+
+    #[repr(C, align(64))]
+    struct StressHeap([u8; STRESS_HEAP_N]);
+
+    static mut STRESS_HEAP: StressHeap = StressHeap([0; STRESS_HEAP_N]);
+
+    fn stress_base() -> u64 {
+        &raw const STRESS_HEAP as u64
+    }
+
+    struct StressConfig;
+
+    impl Config for StressConfig {
+        type Atomics = CoreAtomics;
+        const MIN_ALIGN: u64 = 16;
+        const LNR_FLOOR: u64 = 32;
+        const EXP_FLOOR: u64 = 256;
+        const EXP_CEIL: u64 = 8192; // low enough that the churn hits oversized too
+        fn heap_base() -> u64 {
+            stress_base()
+        }
+        fn heap_size() -> u64 {
+            STRESS_HEAP_N as u64
+        }
+    }
+
+    /// Hands out globally-unique, nonzero fill tokens.
+    static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+    /// Payloads are class-exact multiples of `MIN_ALIGN`, so `len` is a whole
+    /// number of `u64` words. Fill every word with `token`.
+    fn fill(s: Slice, token: u64) {
+        let words = (s.len / 8) as usize;
+        let p = s.ptr as *mut u64;
+        for i in 0..words {
+            // SAFETY: `s` is a live payload owned by this thread; no other thread
+            // can touch these bytes until we free it. Volatile to defeat elision.
+            unsafe { p.add(i).write_volatile(token) };
+        }
+    }
+
+    /// Verifies the first `words` u64s of `s` all equal `token`.
+    fn check_prefix(s: Slice, token: u64, words: usize) {
+        let p = s.ptr as *const u64;
+        for i in 0..words {
+            // SAFETY: as `fill`; reading our own live payload.
+            let v = unsafe { p.add(i).read_volatile() };
+            assert_eq!(v, token, "corruption at word {i} of {:#x}", s.ptr);
+        }
+    }
+
+    fn check(s: Slice, token: u64) {
+        check_prefix(s, token, (s.len / 8) as usize);
+    }
+
+    #[test]
+    fn concurrent_alloc_free_realloc_no_corruption() {
+        let a = CadAlloc::<StressConfig>::new();
+        a.init().expect("init");
+        assert_eq!(a.verify(), Ok(()));
+
+        const THREADS: usize = 8;
+        const OPS: usize = 6000;
+
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            handles.push(std::thread::spawn(move || {
+                // A fresh handle; state lives in the shared heap, not the handle.
+                let a = CadAlloc::<StressConfig>::new();
+
+                // Per-thread xorshift64 — no external RNG dependency.
+                let mut rng =
+                    0x9E37_79B9_7F4A_7C15u64 ^ (t as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03);
+                let mut next = move || {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    rng
+                };
+
+                let mut live: Vec<(Slice, u64)> = Vec::new();
+                for _ in 0..OPS {
+                    let roll = next() % 100;
+                    if roll < 45 || live.is_empty() {
+                        // Allocate; sizes span linear, exponential, and oversized.
+                        let size = 8 + next() % 12_000;
+                        let s = a.alloc(size);
+                        if !s.is_null() {
+                            assert_eq!(s.ptr % 16, 0, "payload misaligned");
+                            assert!(s.len + 16 >= size + 16 || s.len >= size);
+                            let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+                            fill(s, token);
+                            live.push((s, token));
+                        }
+                    } else if roll < 80 {
+                        // Free a random live block, verifying it first.
+                        let i = (next() as usize) % live.len();
+                        let (s, token) = live.swap_remove(i);
+                        check(s, token);
+                        a.free(s);
+                    } else {
+                        // Reallocate a random live block; the retained prefix must
+                        // survive the (possibly relocating) resize.
+                        let i = (next() as usize) % live.len();
+                        let (s, token) = live[i];
+                        check(s, token);
+                        let new_size = 8 + next() % 12_000;
+                        let g = a.realloc(s, new_size);
+                        if g.is_null() {
+                            // realloc failed: the original is left valid.
+                            check(s, token);
+                        } else {
+                            let kept = core::cmp::min(s.len, g.len);
+                            check_prefix(g, token, (kept / 8) as usize);
+                            let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+                            fill(g, token);
+                            live[i] = (g, token);
+                        }
+                    }
+                }
+
+                // Return everything still held so the heap ends drained.
+                for (s, token) in live {
+                    check(s, token);
+                    a.free(s);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join()
+                .expect("a stress thread panicked (corruption detected)");
+        }
+
+        // Metadata survived the churn, and the heap can still serve requests.
+        assert_eq!(a.verify(), Ok(()));
+        let s = a.alloc(64);
+        assert!(!s.is_null(), "heap unusable after stress");
+        a.free(s);
+    }
+}
+
+// --- loom model check of the lock-free Treiber-stack bins -------------------
+//
+// Run with: `RUSTFLAGS="--cfg loom" cargo test --test ... treiber` (loom is a
+// dev-dependency only under `--cfg loom`). Loom exhaustively explores thread
+// interleavings and memory orderings for a *small* scenario, which is exactly
+// the right tool for the bins' push/pop CAS protocol and its ABA tag. It cannot
+// model the whole allocator: a real heap is far too many atomic locations for
+// the state space, and the allocator addresses memory by raw `u64`, which loom's
+// instrumented atomics cannot back directly. So we bridge the address-based
+// `Atomics` trait to a tiny array of loom atomics and drive the real
+// `push_fixed` / `pop_fixed` over it.
+#[cfg(loom)]
+mod loom_stack {
+    use crate::allocator::CadAlloc;
+    use crate::atomic::Atomics;
+    use crate::config::Config;
+    use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicU64, Ordering::SeqCst};
+    use std::cell::Cell;
+    use std::vec::Vec;
+
+    /// Synthetic heap base; bin 0's head lives at `BASE + META_BYTES` (`+16`).
+    const BASE: u64 = 0x1_0000;
+    /// A handful of `u64` cells — head plus a couple of block `next` slots.
+    const CELLS: usize = 32;
+
+    /// A tiny "heap" of loom atomics, addressed by synthetic `u64` addresses.
+    struct LoomHeap {
+        words: Vec<AtomicU64>,
+    }
+
+    impl LoomHeap {
+        fn new() -> Self {
+            let mut words = Vec::with_capacity(CELLS);
+            for _ in 0..CELLS {
+                words.push(AtomicU64::new(0));
+            }
+            Self { words }
+        }
+
+        fn at(&self, addr: u64) -> &AtomicU64 {
+            &self.words[((addr - BASE) / 8) as usize]
+        }
+    }
+
+    std::thread_local! {
+        /// Per-thread pointer to the model's shared heap, installed at entry.
+        static HEAP: Cell<*const LoomHeap> = const { Cell::new(core::ptr::null()) };
+    }
+
+    fn set_heap(h: &Arc<LoomHeap>) {
+        HEAP.with(|c| c.set(&**h as *const LoomHeap));
+    }
+
+    fn with_heap<R>(f: impl FnOnce(&LoomHeap) -> R) -> R {
+        HEAP.with(|c| {
+            // SAFETY: `set_heap` installed a pointer to an `Arc<LoomHeap>` that is
+            // held alive (by this thread's closure, or by `main`) for the whole
+            // model iteration in which any atomic op runs.
+            let h = unsafe { &*c.get() };
+            f(h)
+        })
+    }
+
+    /// An [`Atomics`] backend over loom atomics, so loom can instrument every
+    /// access the allocator makes to the bins.
+    struct LoomAtomics;
+
+    impl Atomics for LoomAtomics {
+        unsafe fn atomic_load(addr: u64) -> u64 {
+            with_heap(|h| h.at(addr).load(SeqCst))
+        }
+        unsafe fn atomic_store(addr: u64, val: u64) {
+            with_heap(|h| h.at(addr).store(val, SeqCst));
+        }
+        unsafe fn atomic_cas(addr: u64, current: u64, new: u64) -> u64 {
+            with_heap(
+                |h| match h.at(addr).compare_exchange(current, new, SeqCst, SeqCst) {
+                    Ok(p) | Err(p) => p,
+                },
+            )
+        }
+        unsafe fn atomic_cas_weak(addr: u64, current: u64, new: u64) -> (u64, bool) {
+            with_heap(|h| {
+                match h
+                    .at(addr)
+                    .compare_exchange_weak(current, new, SeqCst, SeqCst)
+                {
+                    Ok(p) => (p, true),
+                    Err(p) => (p, false),
+                }
+            })
+        }
+    }
+
+    struct LoomConfig;
+
+    impl Config for LoomConfig {
+        type Atomics = LoomAtomics;
+        const MIN_ALIGN: u64 = 16;
+        const LNR_FLOOR: u64 = 32;
+        const EXP_FLOOR: u64 = 256;
+        const EXP_CEIL: u64 = 65536;
+        const HEAP_BASE: u64 = BASE;
+        const HEAP_SIZE: u64 = (CELLS as u64) * 8;
+    }
+
+    #[test]
+    fn treiber_stack_push_pop_conserves_blocks() {
+        loom::model(|| {
+            let heap = Arc::new(LoomHeap::new());
+            set_heap(&heap);
+
+            // Two distinct, MIN_ALIGN-aligned block headers, each with room for a
+            // `next` word at `+8`, clear of bin 0's head at BASE+16.
+            const A: u64 = BASE + 64;
+            const B: u64 = BASE + 96;
+
+            let h1 = heap.clone();
+            let t1 = loom::thread::spawn(move || {
+                set_heap(&h1);
+                let a = CadAlloc::<LoomConfig>::new();
+                a.push_fixed(0, A);
+                a.pop_fixed(0)
+            });
+            let h2 = heap.clone();
+            let t2 = loom::thread::spawn(move || {
+                set_heap(&h2);
+                let a = CadAlloc::<LoomConfig>::new();
+                a.push_fixed(0, B);
+                a.pop_fixed(0)
+            });
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Two pushes and two pops, so — for any interleaving — both pops must
+            // succeed, together remove exactly {A, B}, and leave the stack empty.
+            // A lost update, a duplicated pop, or an ABA slip breaks one of these.
+            let a = CadAlloc::<LoomConfig>::new();
+            assert_eq!(a.pop_fixed(0), 0, "stack not empty after both pops");
+            assert!(r1 != 0 && r2 != 0, "a pop lost its block: {r1:#x}, {r2:#x}");
+            assert_ne!(r1, r2, "the same block was popped twice");
+            let mut got = [r1, r2];
+            got.sort_unstable();
+            assert_eq!(got, [A, B], "popped blocks are not {{A, B}}");
+        });
     }
 }
