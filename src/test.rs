@@ -327,6 +327,7 @@ crate::export_c_api! {
     config: FfiConfig,
     init: cadtest_init,
     alloc: cadtest_alloc,
+    realloc: cadtest_realloc,
     free: cadtest_free,
     verify: cadtest_verify,
 }
@@ -346,8 +347,98 @@ fn ffi_shims_round_trip() {
     // Reuse after free (LIFO), exercising both alloc and free shims.
     let s2 = cadtest_alloc(100, 16);
     assert_eq!(s2.ptr, s.ptr);
-    cadtest_free(s2);
+
+    // realloc shim: grow, then free through the shim.
+    let s3 = cadtest_realloc(s2, 2000, 16);
+    assert!(!s3.is_null());
+    assert!(s3.len >= 2000);
+    cadtest_free(s3);
+
+    // realloc(NULL, ...) behaves like alloc.
+    let s4 = cadtest_realloc(Slice::NULL, 64, 16);
+    assert!(!s4.is_null());
+    cadtest_free(s4);
 
     // Alignment beyond MIN_ALIGN returns the null slice.
     assert!(cadtest_alloc(16, 32).is_null());
+}
+
+// --- realloc (over its own static heap) ------------------------------------
+
+#[repr(C, align(64))]
+struct ReallocHeap([u8; HEAP_N]);
+
+static mut REALLOC_HEAP: ReallocHeap = ReallocHeap([0; HEAP_N]);
+
+fn realloc_heap_base() -> u64 {
+    &raw const REALLOC_HEAP as u64
+}
+
+struct ReallocConfig;
+
+impl Config for ReallocConfig {
+    type Atomics = CoreAtomics;
+    const MIN_ALIGN: u64 = 16;
+    const LNR_FLOOR: u64 = 16;
+    const EXP_FLOOR: u64 = 256;
+    const EXP_CEIL: u64 = 4096;
+    fn heap_base() -> u64 {
+        realloc_heap_base()
+    }
+    fn heap_size() -> u64 {
+        HEAP_N as u64
+    }
+}
+
+#[test]
+fn realloc_grows_shrinks_relocates() {
+    let a = CadAlloc::<ReallocConfig>::new();
+    a.init().expect("init");
+
+    // realloc(NULL, ...) behaves like alloc.
+    let n = a.realloc(Slice::NULL, 50, 16);
+    assert!(!n.is_null());
+    a.free(n);
+
+    // Grow relocates and preserves the old contents.
+    let s = a.alloc(64, 16);
+    assert!(!s.is_null());
+    // SAFETY: `s.ptr` is a live 64-byte payload in our static heap.
+    unsafe {
+        for i in 0..64u64 {
+            (s.ptr as *mut u8).add(i as usize).write(i as u8);
+        }
+    }
+    let g = a.realloc(s, 2000, 16);
+    assert!(!g.is_null());
+    assert!(g.len >= 2000);
+    // SAFETY: `g.ptr` holds the relocated payload.
+    unsafe {
+        for i in 0..64u64 {
+            assert_eq!((g.ptr as *const u8).add(i as usize).read(), i as u8);
+        }
+    }
+    a.free(g);
+
+    // Shrink within the fixed classes stays in place (default SPLIT_MIN keeps
+    // the leftover as internal slack).
+    let f = a.alloc(2000, 16);
+    let cap = f.len;
+    let t = a.realloc(f, 100, 16);
+    assert_eq!(t.ptr, f.ptr, "fixed shrink should not move");
+    assert_eq!(t.len, cap, "fixed shrink keeps the whole block");
+    a.free(t);
+
+    // Oversized shrink splits off the tail, which becomes a reusable free block.
+    let big = a.alloc(12000, 16);
+    assert!(big.len >= 12000);
+    let sh = a.realloc(big, 5000, 16);
+    assert_eq!(sh.ptr, big.ptr, "oversized shrink stays in place");
+    assert!(sh.len >= 5000 && sh.len < big.len, "block actually shrank");
+    // The tail sits immediately after the shrunk front block and is recovered
+    // by the next oversized allocation (first-fit).
+    let reuse = a.alloc(6000, 16);
+    assert_eq!(reuse.ptr, big.ptr + sh.len + 16, "tail should be reused");
+    a.free(sh);
+    a.free(reuse);
 }

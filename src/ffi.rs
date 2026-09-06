@@ -13,6 +13,9 @@
 //!   and is passed and returned by value.
 //! - `alloc(size, align) -> Slice` returns [`Slice::NULL`](crate::Slice::NULL)
 //!   (a zero `ptr`) on failure.
+//! - `realloc(Slice, new_size, align) -> Slice` returns the resized payload, or
+//!   the null slice on failure (leaving the original valid); a null input acts
+//!   like `alloc`.
 //! - `free(Slice)` returns nothing; freeing the null slice is a no-op.
 //! - `init() -> int32_t` and `verify() -> int32_t` return `0` on success, or a
 //!   positive code otherwise:
@@ -42,13 +45,14 @@
 //!     config: MyConfig,
 //!     init: cad_init,
 //!     alloc: cad_alloc,
+//!     realloc: cad_realloc,
 //!     free: cad_free,
 //!     verify: cad_verify,
 //! }
 //! ```
 //!
-//! This emits `cad_init`, `cad_alloc`, `cad_free`, and `cad_verify` as
-//! unmangled `extern "C"` symbols bound to `MyConfig`.
+//! This emits `cad_init`, `cad_alloc`, `cad_realloc`, `cad_free`, and
+//! `cad_verify` as unmangled `extern "C"` symbols bound to `MyConfig`.
 //!
 //! # Calling convention
 //!
@@ -73,6 +77,7 @@
 //!     abi: "system",
 //!     init: cad_init,
 //!     alloc: cad_alloc,
+//!     realloc: cad_realloc,
 //!     free: cad_free,
 //!     verify: cad_verify,
 //! }
@@ -82,7 +87,7 @@
 /// [`Config`](crate::Config).
 ///
 /// See the [module documentation](crate::ffi) for the ABI and status codes. All
-/// four names are required and given in the order shown:
+/// five names are required and given in the order shown:
 ///
 /// ```
 /// # use cadalloc::{Config, CoreAtomics};
@@ -100,6 +105,7 @@
 ///     config: MyConfig,
 ///     init: cad_init,
 ///     alloc: cad_alloc,
+///     realloc: cad_realloc,
 ///     free: cad_free,
 ///     verify: cad_verify,
 /// }
@@ -112,10 +118,11 @@ macro_rules! export_c_api {
         abi: $abi:literal,
         init: $init:ident,
         alloc: $alloc:ident,
+        realloc: $realloc:ident,
         free: $free:ident,
         verify: $verify:ident $(,)?
     ) => {
-        $crate::export_c_api!(@emit $abi, $config, $init, $alloc, $free, $verify);
+        $crate::export_c_api!(@emit $abi, $config, $init, $alloc, $realloc, $free, $verify);
     };
 
     // Default calling convention: `"C"`.
@@ -123,13 +130,14 @@ macro_rules! export_c_api {
         config: $config:ty,
         init: $init:ident,
         alloc: $alloc:ident,
+        realloc: $realloc:ident,
         free: $free:ident,
         verify: $verify:ident $(,)?
     ) => {
-        $crate::export_c_api!(@emit "C", $config, $init, $alloc, $free, $verify);
+        $crate::export_c_api!(@emit "C", $config, $init, $alloc, $realloc, $free, $verify);
     };
 
-    (@emit $abi:literal, $config:ty, $init:ident, $alloc:ident, $free:ident, $verify:ident) => {
+    (@emit $abi:literal, $config:ty, $init:ident, $alloc:ident, $realloc:ident, $free:ident, $verify:ident) => {
         /// Prepares the heap. Returns `0` on success, or the `InitError`
         /// discriminant (`1` misaligned, `2` too small).
         #[unsafe(no_mangle)]
@@ -145,6 +153,14 @@ macro_rules! export_c_api {
         #[unsafe(no_mangle)]
         pub extern $abi fn $alloc(size: u64, align: u64) -> $crate::Slice {
             $crate::CadAlloc::<$config>::new().alloc(size, align)
+        }
+
+        /// Resizes `block` to `new_size` bytes with `align` alignment. Returns
+        /// the (possibly moved) payload slice, or the null slice on failure
+        /// (the original block is left valid). A null `block` acts like `alloc`.
+        #[unsafe(no_mangle)]
+        pub extern $abi fn $realloc(block: $crate::Slice, new_size: u64, align: u64) -> $crate::Slice {
+            $crate::CadAlloc::<$config>::new().realloc(block, new_size, align)
         }
 
         /// Returns a block previously handed out by the matching `alloc`.

@@ -3,7 +3,7 @@
 //! The whole configuration step is implementing [`Config`] once: name an
 //! atomics backend and the four power-of-two size-class constants.
 
-use cadalloc::{Config, CoreAtomics};
+use cadalloc::{CadAlloc, Config, CoreAtomics};
 
 /// A configuration for a 1 MiB statically-known heap.
 struct ExampleConfig;
@@ -28,7 +28,7 @@ impl Config for ExampleConfig {
 const _: () = cadalloc::assert_config_valid::<ExampleConfig>();
 
 fn main() {
-    println!("cadalloc {}", cadalloc::version());
+    println!("bins: {}", CadAlloc::<ExampleConfig>::bin_count());
     println!(
         "heap: base = {:#x}, size = {} bytes",
         cadalloc::const_heap_base::<ExampleConfig>(),

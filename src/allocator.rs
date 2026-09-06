@@ -450,6 +450,27 @@ impl<C: Config> CadAlloc<C> {
         Ok(())
     }
 
+    /// The exact total block size [`alloc`](CadAlloc::alloc) would carve for a
+    /// `size`-byte request: the containing fixed class, or the header-rounded
+    /// `need` for an oversized request.
+    #[inline]
+    fn request_block_size(size: u64) -> u64 {
+        let need = align_up(size, C::MIN_ALIGN) + C::MIN_ALIGN; // + header
+        let bin = bin_index::<C>(need);
+        if bin == Self::oversize_bin() {
+            need
+        } else {
+            bin_class::<C>(bin)
+        }
+    }
+
+    /// Returns `true` if `align` is unsupported (not a power of two, or larger
+    /// than `MIN_ALIGN`, which is all this pass handles).
+    #[inline]
+    fn bad_align(align: u64) -> bool {
+        align > C::MIN_ALIGN || (align > 1 && !align.is_power_of_two())
+    }
+
     /// Allocates a block with at least `size` payload bytes and the given
     /// `align`, returning a [`Slice`] over its payload, or [`Slice::NULL`] on
     /// failure.
@@ -461,7 +482,7 @@ impl<C: Config> CadAlloc<C> {
     #[must_use]
     #[inline]
     pub fn alloc(&self, size: u64, align: u64) -> Slice {
-        if align > C::MIN_ALIGN || (align > 1 && !align.is_power_of_two()) {
+        if Self::bad_align(align) {
             return Slice::NULL;
         }
         let need = align_up(size, C::MIN_ALIGN) + C::MIN_ALIGN; // + header
@@ -499,6 +520,69 @@ impl<C: Config> CadAlloc<C> {
         } else {
             self.push_fixed(bin, hdr);
         }
+    }
+
+    /// Resizes `block` to hold at least `new_size` payload bytes, returning a
+    /// [`Slice`] over the result (possibly the same address, possibly moved), or
+    /// [`Slice::NULL`] on failure.
+    ///
+    /// Follows C `realloc` conventions: reallocating [`Slice::NULL`] is
+    /// equivalent to [`alloc`](CadAlloc::alloc), and on failure the original
+    /// block is left untouched (not freed). Because blocks are never coalesced,
+    /// growth beyond the current block relocates: a fresh block is allocated,
+    /// the payload is copied, and the old block is freed. Shrinking stays in
+    /// place, splitting off the tail only when the leftover is worth it (the
+    /// `SPLIT_MIN` / `CARVE_MAX` rule, so with the default `SPLIT_MIN` a shrink
+    /// within the fixed classes just keeps the block and its slack).
+    ///
+    /// `align` carries the same restriction as [`alloc`](CadAlloc::alloc).
+    #[inline]
+    pub fn realloc(&self, block: Slice, new_size: u64, align: u64) -> Slice {
+        if block.is_null() {
+            return self.alloc(new_size, align);
+        }
+        if Self::bad_align(align) {
+            return Slice::NULL;
+        }
+
+        let hdr = block.ptr - C::MIN_ALIGN;
+        let cur_size = header_size(self.load(hdr));
+        let target = Self::request_block_size(new_size);
+
+        if cur_size >= target {
+            // Fits in place. Split off the tail only when it clears the bar.
+            let leftover = cur_size - target;
+            if leftover >= C::SPLIT_MIN && leftover >= C::MIN_ALIGN && C::CARVE_MAX >= 2 {
+                self.lock();
+                self.store(hdr, pack(target, USED));
+                self.insert_free_locked(hdr + target, leftover);
+                self.unlock();
+                return Slice::new(block.ptr, target - C::MIN_ALIGN);
+            }
+            return Slice::new(block.ptr, cur_size - C::MIN_ALIGN);
+        }
+
+        // Grow: relocate. Allocate first so a failure leaves the original valid.
+        let dst = self.alloc(new_size, align);
+        if dst.is_null() {
+            return Slice::NULL;
+        }
+        let copy_len = {
+            let old = cur_size - C::MIN_ALIGN;
+            if old < dst.len { old } else { dst.len }
+        };
+        // SAFETY: `block` and `dst` are distinct, caller-owned payloads, each
+        // valid for `copy_len` bytes; the block being resized is not touched
+        // concurrently.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                block.ptr as *const u8,
+                dst.ptr as *mut u8,
+                copy_len as usize,
+            );
+        }
+        self.free(block);
+        dst
     }
 
     // --- fixed-class allocation --------------------------------------------

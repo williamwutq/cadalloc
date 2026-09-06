@@ -32,12 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Statically-computed bin counts on `Config` (`NUM_LINEAR`, `NUM_EXP`,
   `NUM_BINS`) derived from the size constants.
 - Allocator core: `CadAlloc<C>` (a zero-sized handle whose state lives in the
-  managed heap) with `init`, `alloc`, and `free`. Fixed size-class bins are
-  lock-free Treiber stacks with an ABA tag; the bump pointer and oversized free
-  list run under one refill spinlock. Block headers are a single `u64`
-  (`size << 8 | free-byte`) in the `MIN_ALIGN` header region; no footer, no
-  coalescing. Oversized blocks split subject to `SPLIT_MIN`/`CARVE_MAX`.
-  `InitError` reports a misaligned or too-small heap.
+  managed heap) with `init`, `alloc`, `realloc`, and `free`. Fixed size-class
+  bins are lock-free Treiber stacks with an ABA tag; the bump pointer and
+  oversized free list run under one refill spinlock. Block headers are a single
+  `u64` (`size << 8 | free-byte`) in the `MIN_ALIGN` header region; no footer,
+  no coalescing. Oversized blocks split subject to `SPLIT_MIN`/`CARVE_MAX`.
+  `realloc` follows C conventions (a null input acts like `alloc`, and on
+  failure the original block is preserved): it resizes in place, splitting off
+  the tail when the leftover clears `SPLIT_MIN`/`CARVE_MAX`, and relocates
+  (allocate, copy, free) when growth exceeds the current block. `InitError`
+  reports a misaligned or too-small heap.
 - Heap metadata and `CadAlloc::verify`: an initialized heap begins with the
   `"CADALLOC"` marker (little-endian) and a 64-bit configuration fingerprint
   (packed base-2 logarithms of the power-of-two constants, avalanched with
@@ -46,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so they are FFI-safe and each variant's discriminant is the status code the C
   shims return (success is `0`).
 - `export_c_api!` macro (module `ffi`): emits unmangled `extern` entry points
-  (`init`/`alloc`/`free`/`verify`) bound to one concrete configuration, so the
+  (`init`/`alloc`/`realloc`/`free`/`verify`) bound to one concrete configuration, so the
   allocator can be linked from C and other non-Rust callers. The calling
   convention defaults to `"C"` and can be overridden with an `abi:` line (e.g.
   `"system"`, `"sysv64"`, `"aapcs"`).
