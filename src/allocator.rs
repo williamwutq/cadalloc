@@ -289,7 +289,7 @@ impl<C: Config> CadAlloc<C> {
 
     /// Number of bytes reserved for the control region, aligned to `MIN_ALIGN`.
     #[inline(always)]
-    fn control_bytes() -> u64 {
+    const fn control_bytes() -> u64 {
         align_up(META_BYTES + (C::NUM_BINS + 2) * 8, C::MIN_ALIGN)
     }
 
@@ -301,8 +301,39 @@ impl<C: Config> CadAlloc<C> {
 
     /// The oversized bin index.
     #[inline(always)]
-    fn oversize_bin() -> u64 {
+    const fn oversize_bin() -> u64 {
         C::NUM_BINS - 1
+    }
+
+    /// The fixed bin whose class is the *largest* `<= size` (a floor map), for
+    /// `LNR_FLOOR <= size <= EXP_CEIL`.
+    #[inline]
+    const fn floor_bin(size: u64) -> u64 {
+        let ceil = bin_index::<C>(size);
+        if bin_class::<C>(ceil) <= size {
+            ceil
+        } else {
+            ceil - 1
+        }
+    }
+
+    /// The address alignment required of a block in `bin`: `MIN_ALIGN` for linear
+    /// and oversized bins, and half the octave base (`2^(n-1)` for octave `2^n`)
+    /// for exponential bins, never below `MIN_ALIGN`.
+    #[inline]
+    const fn align_of_bin(bin: u64) -> u64 {
+        if bin >= C::NUM_LINEAR && bin < C::NUM_LINEAR + C::NUM_EXP {
+            let octave = (bin - C::NUM_LINEAR) / 2;
+            let base_log2 = C::EXP_FLOOR.ilog2() as u64 + octave;
+            let align = 1u64 << (base_log2 - 1);
+            if align < C::MIN_ALIGN {
+                C::MIN_ALIGN
+            } else {
+                align
+            }
+        } else {
+            C::MIN_ALIGN
+        }
     }
 
     // --- raw heap-word access (see module safety invariant) ----------------
@@ -454,7 +485,7 @@ impl<C: Config> CadAlloc<C> {
     /// `size`-byte request: the containing fixed class, or the header-rounded
     /// `need` for an oversized request.
     #[inline]
-    fn request_block_size(size: u64) -> u64 {
+    const fn request_block_size(size: u64) -> u64 {
         let need = align_up(size, C::MIN_ALIGN) + C::MIN_ALIGN; // + header
         let bin = bin_index::<C>(need);
         if bin == Self::oversize_bin() {
@@ -467,7 +498,7 @@ impl<C: Config> CadAlloc<C> {
     /// Returns `true` if `align` is unsupported (not a power of two, or larger
     /// than `MIN_ALIGN`, which is all this pass handles).
     #[inline]
-    fn bad_align(align: u64) -> bool {
+    const fn bad_align(align: u64) -> bool {
         align > C::MIN_ALIGN || (align > 1 && !align.is_power_of_two())
     }
 
@@ -511,6 +542,8 @@ impl<C: Config> CadAlloc<C> {
         }
         let hdr = block.ptr - C::MIN_ALIGN;
         let size = header_size(self.load(hdr));
+        // Every block is class-exact (fixed) or `> EXP_CEIL` (oversized), so the
+        // ceiling bin index is also its exact home.
         let bin = bin_index::<C>(size);
         self.store(hdr, pack(size, FREE));
         if bin == Self::oversize_bin() {
@@ -550,16 +583,15 @@ impl<C: Config> CadAlloc<C> {
         let target = Self::request_block_size(new_size);
 
         if cur_size >= target {
-            // Fits in place. Split off the tail only when it clears the bar.
-            let leftover = cur_size - target;
-            if leftover >= C::SPLIT_MIN && leftover >= C::MIN_ALIGN && C::CARVE_MAX >= 2 {
-                self.lock();
-                self.store(hdr, pack(target, USED));
-                self.insert_free_locked(hdr + target, leftover);
-                self.unlock();
-                return Slice::new(block.ptr, target - C::MIN_ALIGN);
+            // Fits in place. Carve the excess only when it clears SPLIT_MIN;
+            // otherwise avoid the lock and keep the block whole.
+            if cur_size - target < C::SPLIT_MIN {
+                return Slice::new(block.ptr, cur_size - C::MIN_ALIGN);
             }
-            return Slice::new(block.ptr, cur_size - C::MIN_ALIGN);
+            self.lock();
+            let alloc_size = self.split_and_free_tail(hdr, cur_size, target);
+            self.unlock();
+            return Slice::new(block.ptr, alloc_size - C::MIN_ALIGN);
         }
 
         // Grow: relocate. Allocate first so a failure leaves the original valid.
@@ -588,11 +620,10 @@ impl<C: Config> CadAlloc<C> {
     // --- fixed-class allocation --------------------------------------------
 
     /// Allocates a fixed-class block from `bin`, returning its address (header),
-    /// or `0` if the heap is exhausted. The returned block's header is marked
-    /// used with its class size.
+    /// or `0` if the heap is exhausted. Blocks in a fixed bin are always exactly
+    /// the class size, so the returned block is stamped used at the class size.
     #[inline]
     fn alloc_fixed(&self, bin: u64) -> u64 {
-        // Blocks in a fixed bin are always exactly the class size.
         let class = bin_class::<C>(bin);
 
         // Fast path: a free block already in the bin.
@@ -604,14 +635,19 @@ impl<C: Config> CadAlloc<C> {
 
         // Slow path: re-check under the lock (another thread may have freed
         // into this bin), else carve a fresh class-sized block from the bump
-        // region.
+        // region. Exponential blocks must land on their class alignment, so the
+        // bump pointer is rounded up and the gap freed; linear/oversized bins
+        // have `MIN_ALIGN` alignment, for which the round-up is a no-op.
+        let align = Self::align_of_bin(bin);
         self.lock();
         let mut block = self.pop_fixed(bin);
         if block == 0 {
             let bump = self.load(self.bump_addr());
-            if bump + class <= self.heap_end() {
-                self.store(self.bump_addr(), bump + class);
-                block = bump;
+            let aligned = align_up(bump, align);
+            if aligned + class <= self.heap_end() {
+                self.carve_gap(bump, aligned);
+                self.store(self.bump_addr(), aligned + class);
+                block = aligned;
             }
         }
         self.unlock();
@@ -635,24 +671,101 @@ impl<C: Config> CadAlloc<C> {
         self.store(head, addr);
     }
 
-    /// Inserts a free block of `size` bytes into its correct bin while holding
-    /// the refill lock: the oversized list directly, or a fixed bin via its
-    /// lock-free push.
+    /// The largest block that can be carved off ending at address `end` from a
+    /// region of `len` bytes: `(size, bin)`, or `(0, 0)` if nothing fits.
+    ///
+    /// A region `> EXP_CEIL` yields one oversized block spanning all of it. A
+    /// smaller region yields the largest fixed class `<= len` whose alignment
+    /// the placement `end - size` satisfies (equivalently `align | end`, since
+    /// the class size is a multiple of its alignment). Alignment is
+    /// non-increasing as the bin shrinks and bin 0 requires only `MIN_ALIGN`
+    /// (always met, as `end` is `MIN_ALIGN`-aligned), so the search terminates.
     #[inline]
-    fn insert_free_locked(&self, addr: u64, size: u64) {
-        self.store(addr, pack(size, FREE));
-        let bin = bin_index::<C>(size);
-        if bin == Self::oversize_bin() {
-            self.push_oversize_locked(addr);
-        } else {
-            self.push_fixed(bin, addr);
+    const fn largest_carvable(end: u64, len: u64) -> (u64, u64) {
+        if len < C::LNR_FLOOR {
+            return (0, 0);
         }
+        if len > C::EXP_CEIL {
+            return (len, Self::oversize_bin());
+        }
+        let mut bin = Self::floor_bin(len);
+        while (end & (Self::align_of_bin(bin) - 1)) != 0 {
+            if bin == 0 {
+                return (0, 0);
+            }
+            bin -= 1;
+        }
+        (bin_class::<C>(bin), bin)
+    }
+
+    /// Frees the alignment gap `[lo, hi)` left when the bump pointer is rounded
+    /// up so an exponential block lands on its class alignment. Carves the gap
+    /// into class-exact, aligned free blocks, largest first, *without* a
+    /// `CARVE_MAX` bound (the gap is bounded — smaller than the block's class).
+    /// A sub-class sliver at the low end is only possible when
+    /// `LNR_FLOOR > MIN_ALIGN`, and is then unavoidable dead space. Caller holds
+    /// the refill lock.
+    #[inline]
+    fn carve_gap(&self, lo: u64, hi: u64) {
+        let mut end = hi;
+        while end - lo >= C::MIN_ALIGN {
+            let (size, bin) = Self::largest_carvable(end, end - lo);
+            if size == 0 {
+                break;
+            }
+            end -= size;
+            self.store(end, pack(size, FREE));
+            if bin == Self::oversize_bin() {
+                self.push_oversize_locked(end);
+            } else {
+                self.push_fixed(bin, end);
+            }
+        }
+    }
+
+    /// Carves the excess of an in-use block `[block, block + bsize)` beyond
+    /// `need` into free blocks, marks the block used at its final size, and
+    /// returns that size. The caller must hold the refill lock.
+    ///
+    /// If the excess is below `SPLIT_MIN` the whole block is kept (the excess
+    /// stays as internal slack). Otherwise blocks are carved from the *top* of
+    /// the excess, largest first (see [`largest_carvable`](Self::largest_carvable)),
+    /// for at most `CARVE_MAX` iterations; every carved block is class-exact (or
+    /// one oversized block) and aligned, so it lands in the correct free list.
+    /// Any un-carved remainder settles against the block and folds back into it
+    /// — nothing is leaked.
+    #[inline]
+    fn split_and_free_tail(&self, block: u64, bsize: u64, need: u64) -> u64 {
+        if bsize - need < C::SPLIT_MIN {
+            self.store(block, pack(bsize, USED));
+            return bsize;
+        }
+        let ptr = block + need;
+        let mut end = block + bsize;
+        let mut iter = 0;
+        while end - ptr >= C::MIN_ALIGN && iter < C::CARVE_MAX {
+            let (size, bin) = Self::largest_carvable(end, end - ptr);
+            if size == 0 {
+                break;
+            }
+            end -= size;
+            self.store(end, pack(size, FREE));
+            if bin == Self::oversize_bin() {
+                self.push_oversize_locked(end);
+            } else {
+                self.push_fixed(bin, end);
+            }
+            iter += 1;
+        }
+        let alloc_size = end - block; // folds the un-carved remainder back in
+        self.store(block, pack(alloc_size, USED));
+        alloc_size
     }
 
     /// Allocates an oversized block of total size `need` (`> EXP_CEIL`): a
     /// first-fit search of the oversized free list, else a bump carve. A block
-    /// larger than needed is split when the leftover is worth it. Returns the
-    /// block address (header, marked used), or `0` on exhaustion.
+    /// larger than needed has its excess carved (see `split_and_free_tail`).
+    /// Returns the block address (header, marked used), or `0` on exhaustion.
     #[inline]
     fn alloc_oversize(&self, need: u64) -> u64 {
         self.lock();
@@ -675,16 +788,9 @@ impl<C: Config> CadAlloc<C> {
         }
 
         let block = if chosen != 0 {
-            // Unlink and (maybe) split.
-            self.store(chosen_prev_link, self.load(chosen + 8));
+            self.store(chosen_prev_link, self.load(chosen + 8)); // unlink
             let bsize = header_size(self.load(chosen));
-            let leftover = bsize - need;
-            if leftover >= C::SPLIT_MIN && leftover >= C::MIN_ALIGN && C::CARVE_MAX >= 2 {
-                self.store(chosen, pack(need, USED));
-                self.insert_free_locked(chosen + need, leftover);
-            } else {
-                self.store(chosen, pack(bsize, USED));
-            }
+            self.split_and_free_tail(chosen, bsize, need);
             chosen
         } else {
             // Bump a fresh block of exactly `need`.

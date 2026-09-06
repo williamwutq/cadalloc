@@ -59,11 +59,11 @@ use crate::atomic::Atomics;
 /// [module documentation](self) for the size-class scheme and an example.
 ///
 /// The four size constants plus `SPLIT_MIN` must all be **powers of two**, and
-/// the size constants must satisfy
-/// `MIN_ALIGN <= LNR_FLOOR <= EXP_FLOOR <= EXP_CEIL`, with `MIN_ALIGN > 8`.
-/// (`CARVE_MAX` is unconstrained.) These rules are checked at compile time by
-/// [`assert_config_valid`] and by the [`VALIDATE`](Config::VALIDATE) associated
-/// constant.
+/// they must satisfy
+/// `MIN_ALIGN <= LNR_FLOOR <= EXP_FLOOR <= EXP_CEIL`, `SPLIT_MIN <= EXP_CEIL`,
+/// with `MIN_ALIGN > 8`. (`CARVE_MAX` is unconstrained.) These rules are checked
+/// at compile time by [`assert_config_valid`] and by the
+/// [`VALIDATE`](Config::VALIDATE) associated constant.
 pub trait Config {
     /// The atomic backend used to coordinate the free lists.
     ///
@@ -90,9 +90,11 @@ pub trait Config {
     /// block instead of retaining as internal slack.
     ///
     /// When a chosen block is larger than the request, the leftover is only
-    /// split out as its own free block if it is at least `SPLIT_MIN` bytes;
-    /// otherwise the whole block is handed out and the excess stays as internal
-    /// fragmentation. Must be a power of two.
+    /// carved into free blocks if it is at least `SPLIT_MIN` bytes; otherwise
+    /// the whole block is handed out and the excess stays as internal
+    /// fragmentation. Must be a power of two and `<= EXP_CEIL` (a leftover worth
+    /// carving must be able to land in a free list, and the largest class is
+    /// `EXP_CEIL`).
     ///
     /// Defaults to [`EXP_CEIL`](Config::EXP_CEIL), which is typically the
     /// optimal threshold.
@@ -201,6 +203,10 @@ pub trait Config {
         assert!(
             Self::SPLIT_MIN.is_power_of_two(),
             "[cadalloc config] SPLIT_MIN must be a power of two"
+        );
+        assert!(
+            Self::SPLIT_MIN <= Self::EXP_CEIL,
+            "[cadalloc config] SPLIT_MIN must be <= EXP_CEIL"
         );
     };
 }

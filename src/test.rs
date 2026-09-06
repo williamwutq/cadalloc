@@ -442,3 +442,126 @@ fn realloc_grows_shrinks_relocates() {
     a.free(sh);
     a.free(reuse);
 }
+
+// --- fixed-range multi-carve (SPLIT_MIN < EXP_CEIL) ------------------------
+
+#[repr(C, align(64))]
+struct CarveHeap([u8; HEAP_N]);
+
+static mut CARVE_HEAP: CarveHeap = CarveHeap([0; HEAP_N]);
+
+fn carve_heap_base() -> u64 {
+    &raw const CARVE_HEAP as u64
+}
+
+/// A low `SPLIT_MIN` so a fixed-range excess (`<= EXP_CEIL`) gets carved into
+/// several class-exact blocks rather than kept as slack.
+struct CarveConfig;
+
+impl Config for CarveConfig {
+    type Atomics = CoreAtomics;
+    const MIN_ALIGN: u64 = 16;
+    const LNR_FLOOR: u64 = 16;
+    const EXP_FLOOR: u64 = 256;
+    const EXP_CEIL: u64 = 4096;
+    const SPLIT_MIN: u64 = 256; // < EXP_CEIL: carve fixed-range excess
+    const CARVE_MAX: u64 = 8; // enough iterations to fully decompose it
+    fn heap_base() -> u64 {
+        carve_heap_base()
+    }
+    fn heap_size() -> u64 {
+        HEAP_N as u64
+    }
+}
+
+// Validates the low-SPLIT_MIN config at compile time.
+const _: () = assert_config_valid::<CarveConfig>();
+
+/// Returns `true` if the payloads `[ptr, ptr+len)` of `a` and `b` overlap.
+fn overlap(a: Slice, b: Slice) -> bool {
+    a.ptr < b.ptr + b.len && b.ptr < a.ptr + a.len
+}
+
+#[repr(C, align(64))]
+struct AlignHeap([u8; HEAP_N]);
+
+static mut ALIGN_HEAP: AlignHeap = AlignHeap([0; HEAP_N]);
+
+fn align_heap_base() -> u64 {
+    &raw const ALIGN_HEAP as u64
+}
+
+struct AlignConfig;
+
+impl Config for AlignConfig {
+    type Atomics = CoreAtomics;
+    const MIN_ALIGN: u64 = 16;
+    const LNR_FLOOR: u64 = 16;
+    const EXP_FLOOR: u64 = 256;
+    const EXP_CEIL: u64 = 65536;
+    fn heap_base() -> u64 {
+        align_heap_base()
+    }
+    fn heap_size() -> u64 {
+        HEAP_N as u64
+    }
+}
+
+#[test]
+fn bump_aligns_exponential_blocks() {
+    let a = CadAlloc::<AlignConfig>::new();
+    a.init().expect("init");
+
+    // Each exponential block's header must sit on its class alignment: half the
+    // octave base (`2^(n-1)` for a block in the `2^n` octave).
+    for &sz in &[300u64, 500, 2000, 5000, 9000] {
+        let s = a.alloc(sz, 16);
+        assert!(!s.is_null());
+        let header = s.ptr - 16; // block start
+        let class = s.len + 16; // class-exact block size
+        assert!(class >= AlignConfig::EXP_FLOOR, "not exponential: {class}");
+        let align = 1u64 << (class.ilog2() - 1);
+        assert_eq!(
+            header % align,
+            0,
+            "class {class} header {header:#x} not {align}-aligned"
+        );
+        a.free(s);
+    }
+}
+
+#[test]
+fn fixed_range_carve_is_non_overlapping() {
+    let a = CadAlloc::<CarveConfig>::new();
+    a.init().expect("init");
+
+    // A max-class (4096) block shrunk to a small class leaves a ~3968-byte
+    // fixed-range excess, which is carved into class-exact free blocks.
+    let big = a.alloc(4080, 16);
+    assert!(!big.is_null());
+    let small = a.realloc(big, 100, 16);
+    assert_eq!(small.ptr, big.ptr, "shrink stays in place");
+    assert!(small.len >= 100 && small.len < 4080, "block shrank");
+
+    // Allocate a spread of sizes: some reuse the carved pieces, some bump. None
+    // may overlap the retained block or each other, and all must be MIN_ALIGN
+    // aligned and inside the heap.
+    let heap_lo = carve_heap_base();
+    let heap_hi = heap_lo + HEAP_N as u64;
+    let mut live = [Slice::NULL; 25];
+    live[0] = small;
+    for k in 1..live.len() {
+        let sz = 16 + (k as u64 % 6) * 130;
+        let s = a.alloc(sz, 16);
+        assert!(!s.is_null(), "alloc {k} failed");
+        assert_eq!(s.ptr % 16, 0, "payload misaligned");
+        assert!(s.ptr >= heap_lo && s.ptr + s.len <= heap_hi, "out of heap");
+        for prev in &live[..k] {
+            assert!(!overlap(s, *prev), "allocation {k} overlaps an earlier one");
+        }
+        live[k] = s;
+    }
+    for s in live {
+        a.free(s);
+    }
+}
