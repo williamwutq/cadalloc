@@ -322,6 +322,16 @@ impl<C: Config> CadAlloc<C> {
         }
     }
 
+    /// Whether `size` bytes form a valid stand-alone block: an oversized region
+    /// (`> EXP_CEIL`, whose exact size lives in its header) or a size that is
+    /// *exactly* one of the fixed classes. A fixed-range size that is not a class
+    /// is invalid — [`free`](CadAlloc::free) ceil-bins the header, so such a
+    /// block would be reused as a larger class and overrun its neighbour.
+    #[inline]
+    const fn is_block_exact(size: u64) -> bool {
+        size > C::EXP_CEIL || bin_class::<C>(bin_index::<C>(size)) == size
+    }
+
     /// The address alignment required of a block in `bin`: `MIN_ALIGN` for linear
     /// bins, half the octave base (`2^(n-1)` for octave `2^n`) for exponential
     /// bins, and `EXP_CEIL` for the oversized bin (its octave, `2^(c+1)`, aligns
@@ -767,10 +777,17 @@ impl<C: Config> CadAlloc<C> {
     /// If the excess is below `SPLIT_MIN` the whole block is kept (the excess
     /// stays as internal slack). Otherwise blocks are carved from the *top* of
     /// the excess, largest first (see [`largest_carvable`](Self::largest_carvable)),
-    /// for at most `CARVE_MAX` iterations; every carved block is class-exact (or
+    /// for roughly `CARVE_MAX` iterations; every carved block is class-exact (or
     /// one oversized block) and aligned, so it lands in the correct free list.
-    /// Any un-carved remainder settles against the block and folds back into it
-    /// — nothing is leaked.
+    ///
+    /// The retained block must itself stay a valid block — an oversized region,
+    /// or an *exact* fixed class — because [`free`](CadAlloc::free) later maps its
+    /// header size to a bin by ceiling: a fixed-range, non-class-exact size would
+    /// be reused as a larger class and overrun its neighbour. So carving may run
+    /// a few iterations past `CARVE_MAX` to reach a valid retained size, and any
+    /// final uncarvable sub-`LNR_FLOOR` sliver becomes dead space rather than
+    /// inflating the block. The block's start does not move, and it stays aligned
+    /// to its (no larger) class.
     #[inline]
     fn split_and_free_tail(&self, block: u64, bsize: u64, need: u64) -> u64 {
         if bsize - need < C::SPLIT_MIN {
@@ -780,7 +797,16 @@ impl<C: Config> CadAlloc<C> {
         let ptr = block + need;
         let mut end = block + bsize;
         let mut iter = 0;
-        while end - ptr >= C::MIN_ALIGN && iter < C::CARVE_MAX {
+        // Carve class-exact (or oversized) blocks off the top. `CARVE_MAX` bounds
+        // the work, but the retained block `[block, end)` must itself stay a
+        // valid block: an oversized region or an exact class may keep its slack
+        // and stop, whereas a fixed-range, non-class-exact size must be carved
+        // down further — a later `free` ceil-bins the header, so a non-exact
+        // block would be reused as a larger class and overrun its neighbour.
+        // Reaching a valid size costs only a few extra carves past the budget.
+        while end - ptr >= C::MIN_ALIGN
+            && (iter < C::CARVE_MAX || !Self::is_block_exact(end - block))
+        {
             let (size, bin) = Self::largest_carvable(end, end - ptr);
             if size == 0 {
                 break;
@@ -794,7 +820,22 @@ impl<C: Config> CadAlloc<C> {
             }
             iter += 1;
         }
-        let alloc_size = end - block; // folds the un-carved remainder back in
+        // If only an unavoidable sub-`LNR_FLOOR` sliver was left uncarvable, the
+        // retained size may still be non-exact; drop to the largest class that
+        // fits and leave the sliver as dead space, keeping the block class-exact.
+        let mut alloc_size = end - block;
+        if !Self::is_block_exact(alloc_size) {
+            alloc_size = bin_class::<C>(Self::floor_bin(alloc_size));
+        }
+        // Alignment holds without moving `block`: the retained class is no larger
+        // than the original (we only carve off the top), and `align_of_bin` is
+        // non-decreasing in class size, so the retained class's alignment divides
+        // the original's — which `block` already met.
+        debug_assert!(
+            alloc_size > C::EXP_CEIL
+                || block & (Self::align_of_bin(bin_index::<C>(alloc_size)) - 1) == 0,
+            "cadalloc: retained block not aligned to its class"
+        );
         self.store(block, pack(alloc_size, USED));
         alloc_size
     }

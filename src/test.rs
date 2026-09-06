@@ -688,6 +688,96 @@ fn fixed_range_carve_is_non_overlapping() {
     }
 }
 
+// --- realloc-shrink retains a class-exact, aligned block -------------------
+//
+// Shrinking a large block carves its tail under a bounded `CARVE_MAX`; the block
+// that is kept must still be a *valid* block — an exact fixed class or an
+// oversized region — and must stay aligned to that class, or a later free would
+// ceil-bin it and hand it out over-large (overrunning its neighbour). A small
+// `CARVE_MAX` here forces the bounded-carve/fold path that used to leave a
+// non-class-exact remainder.
+
+#[repr(C, align(65536))]
+struct ShrinkHeap([u8; 1 << 20]);
+
+static mut SHRINK_HEAP: ShrinkHeap = ShrinkHeap([0; 1 << 20]);
+
+struct ShrinkConfig;
+
+impl Config for ShrinkConfig {
+    type Atomics = CoreAtomics;
+    const MIN_ALIGN: u64 = 16;
+    const LNR_FLOOR: u64 = 32;
+    const EXP_FLOOR: u64 = 256;
+    const EXP_CEIL: u64 = 8192;
+    const SPLIT_MIN: u64 = 256; // low, so an oversized->small shrink splits
+    const CARVE_MAX: u64 = 2; // low, so the bounded-carve/fold path is hit
+    fn heap_base() -> u64 {
+        &raw const SHRINK_HEAP as u64
+    }
+    fn heap_size() -> u64 {
+        (1 << 20) as u64
+    }
+}
+
+const _: () = assert_config_valid::<ShrinkConfig>();
+
+#[test]
+fn realloc_shrink_retains_class_exact_aligned_block() {
+    type C = ShrinkConfig;
+
+    // The alignment a class of `size` demands (mirrors `align_of_bin`).
+    fn class_align(size: u64) -> u64 {
+        if size > C::EXP_CEIL {
+            C::EXP_CEIL
+        } else if size < C::EXP_FLOOR {
+            C::MIN_ALIGN
+        } else {
+            (1u64 << (size.ilog2() - 1)).max(C::MIN_ALIGN)
+        }
+    }
+    // A block size is valid iff oversized or exactly one of the fixed classes.
+    fn is_class_exact(size: u64) -> bool {
+        size > C::EXP_CEIL || bin_class::<C>(bin_index::<C>(size)) == size
+    }
+
+    let a = CadAlloc::<C>::new();
+    a.init().expect("init");
+
+    for &sz in &[9_000u64, 10_000, 12_016, 16_000, 20_000, 30_000, 50_000] {
+        let big = a.alloc(sz);
+        assert!(!big.is_null(), "alloc {sz} failed");
+
+        let s = a.realloc(big, 200);
+        assert_eq!(s.ptr, big.ptr, "oversized shrink should stay in place");
+
+        let block = s.ptr - C::MIN_ALIGN;
+        let class = s.len + C::MIN_ALIGN; // retained block's stamped size
+        assert!(
+            is_class_exact(class),
+            "retained size {class} (from {sz}) is not class-exact"
+        );
+        assert_eq!(
+            block % class_align(class),
+            0,
+            "retained block {block:#x} (size {class}) not aligned to its class"
+        );
+
+        // A fresh allocation must not overlap the retained block: if `class` were
+        // over-stated, this block would claim past its end into the next one.
+        let other = a.alloc(200);
+        assert!(!other.is_null());
+        assert!(
+            other.ptr >= s.ptr + s.len || s.ptr >= other.ptr + other.len,
+            "new allocation overlaps the retained block"
+        );
+        a.free(other);
+        a.free(s);
+    }
+
+    assert_eq!(a.verify(), Ok(()));
+}
+
 // --- GlobalAlloc adapter (feature `alloc`, over its own static heap) --------
 
 #[cfg(feature = "alloc")]
@@ -882,7 +972,7 @@ mod stress {
                         let i = (next() as usize) % live.len();
                         let (s, token) = live[i];
                         check(s, token);
-                        let new_size = 8 + next() % (s.len.max(16));
+                        let new_size = 8 + next() % 12_000;
                         let g = a.realloc(s, new_size);
                         if g.is_null() {
                             // realloc failed: the original is left valid.
