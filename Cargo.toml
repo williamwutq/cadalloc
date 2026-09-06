@@ -11,7 +11,16 @@ repository = "https://github.com/williamwutq/cadalloc"
 documentation = "https://docs.rs/cadalloc"
 keywords = ["allocator", "memory", "segregated-free-list", "no_std", "embedded"]
 categories = ["memory-management", "no-std", "concurrency"]
-publish = false
+# Whitelist what gets published: source, one example, and the user-facing docs.
+# Internal design notes (PLANNED.md), CI config, and tooling files are left out.
+# (Cargo.toml is always included.)
+include = [
+    "src/**/*.rs",
+    "examples/basic.rs",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+]
 
 # `changelog` is not a Cargo manifest key; setting it at package level emits
 # "unused manifest key" on every invocation. `[package.metadata]` is the

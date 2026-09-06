@@ -12,6 +12,14 @@ permissions:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    # Non-blocking cells:
+    #   - beta is a canary for the next stable, run for early warning only.
+    #   - windows currently crashes the compiler backend during test codegen
+    #     (STATUS_ILLEGAL_INSTRUCTION, no ICE message) on stable and beta alike;
+    #     it is not a diagnostic our code earned. Keep running it so it goes
+    #     green once the toolchain is fixed, but don't let it block CI for now.
+    # Stable/nightly on Linux and macOS stay required.
+    continue-on-error: ${{ matrix.os == 'windows-latest' || matrix.rust == 'beta' }}
     strategy:
       fail-fast: false
       matrix:

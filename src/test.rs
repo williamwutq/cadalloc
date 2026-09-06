@@ -962,7 +962,7 @@ mod stress {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::vec::Vec;
 
-    const STRESS_HEAP_N: usize = 16 << 20; // 16 MiB
+    const STRESS_HEAP_N: usize = 4 << 20; // 4 MiB (plenty for the churn below)
 
     #[repr(C, align(64))]
     struct StressHeap([u8; STRESS_HEAP_N]);

@@ -22,11 +22,12 @@ global allocator, no thread-local state, and no dependencies.
 - You own a **single, fixed region** of memory to sub-allocate — a static
   buffer, an `mmap`, a device/shared-memory window, a VM/interpreter heap — and
   its size is known up front.
-- You want to address that memory by **`(offset, len)`** rather than by native
-  pointer. This is the unusual, differentiating property: the region need not be
-  in the allocating CPU's own address space. Managing a **GPU/device buffer**, a
-  **shared-memory arena between processes**, or a **WASM-style linear memory** is
-  exactly what the `u64`-slice API is for.
+- You address that memory by **`(base, len)`** as plain `u64`s — a length beside
+  every address, independent of the host pointer type. This is the natural way to
+  hand out real addresses into a fixed **embedded/bare-metal RAM or MMIO region**,
+  and it works just as well when the region is *not* in the allocating CPU's own
+  address space at all — a **GPU/device buffer**, a **shared-memory arena between
+  processes**, or a **WASM-style linear memory**.
 - The workload's allocation sizes are **reasonably homogeneous / bounded**, or
   churn is high enough that freed blocks get reused at the same sizes.
 - You need it to be **`no_std`, small, or dependency-free**.
