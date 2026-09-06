@@ -25,11 +25,12 @@
 //! # Blocks
 //!
 //! Every block begins with a `MIN_ALIGN`-byte header region. Its first `u64`
-//! packs the block's total size (header included) in the high 56 bits and the
-//! free flag in the low byte (`1` = free). Its second `u64` (offset 8, always
-//! inside the header region because `MIN_ALIGN >= 16`) holds the free-list
-//! `next` pointer while the block is free. The payload starts at
-//! `block + MIN_ALIGN`. There is no footer and blocks are never coalesced.
+//! packs the block's total size (header included) — a multiple of `MIN_ALIGN`,
+//! so its low 4 bits are free — with the flags in those low bits (bit 0: `1` =
+//! free). Its second `u64` (offset 8, always inside the header region because
+//! `MIN_ALIGN >= 16`) holds the free-list `next` pointer while the block is
+//! free. The payload starts at `block + MIN_ALIGN`. There is no footer and
+//! blocks are never coalesced.
 //!
 //! # Concurrency
 //!
@@ -54,21 +55,32 @@ use crate::slice::Slice;
 use core::hint::spin_loop;
 use core::marker::PhantomData;
 
-/// Free flag stored in the low byte of a block header.
+/// Block sizes are always multiples of `MIN_ALIGN` (`> 8`, so `>= 16`), hence the
+/// low 4 bits of a header word are always zero and carry the block's flags — no
+/// shifting, and `size` keeps its full magnitude.
+const FLAG_MASK: u64 = 0xF;
+/// Free flag (bit 0 of a block header). Bits 1..4 are reserved.
 const FREE: u64 = 1;
-/// "In use" flag stored in the low byte of a block header.
+/// "In use" flag (bit 0 clear).
 const USED: u64 = 0;
 
-/// Packs a total block `size` and a free/used `flag` into a header word.
+/// Packs a total block `size` (a multiple of `MIN_ALIGN`) and a `flag` into a
+/// header word.
 #[inline(always)]
 const fn pack(size: u64, flag: u64) -> u64 {
-    (size << 8) | (flag & 0xFF)
+    size | (flag & FLAG_MASK)
 }
 
 /// Extracts the total block size from a header word.
 #[inline(always)]
 const fn header_size(header: u64) -> u64 {
-    header >> 8
+    header & !FLAG_MASK
+}
+
+/// Returns `true` if the header's block is marked free.
+#[inline(always)]
+const fn header_is_free(header: u64) -> bool {
+    (header & FLAG_MASK) == FREE
 }
 
 /// Rounds `x` up to a multiple of the power-of-two `align`.
@@ -518,14 +530,21 @@ impl<C: Config> CadAlloc<C> {
     /// its bin. Freeing [`Slice::NULL`] is a no-op.
     ///
     /// The slice's `ptr` must be one returned by this allocator; its `len` is
-    /// ignored (the true size is read from the block header).
+    /// ignored (the true size is read from the block header). A block that is
+    /// already free — a double free, or a bogus slice — is refused (returning it
+    /// to a bin twice would corrupt the free list); debug builds also assert.
     #[inline]
     pub fn free(&self, block: Slice) {
         if block.is_null() {
             return;
         }
         let hdr = block.ptr - C::MIN_ALIGN;
-        let size = header_size(self.load(hdr));
+        let header = self.load(hdr);
+        if header_is_free(header) {
+            debug_assert!(false, "cadalloc: double free or invalid slice");
+            return;
+        }
+        let size = header_size(header);
         // Every block is class-exact (fixed) or `> EXP_CEIL` (oversized), so the
         // ceiling bin index is also its exact home.
         let bin = bin_index::<C>(size);

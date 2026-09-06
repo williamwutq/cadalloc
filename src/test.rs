@@ -425,6 +425,43 @@ fn ffi_shims_round_trip() {
     cadtest_free(s4);
 }
 
+// --- double-free detection (own static heap) -------------------------------
+
+#[repr(C, align(64))]
+struct DfHeap([u8; HEAP_N]);
+
+static mut DF_HEAP: DfHeap = DfHeap([0; HEAP_N]);
+
+struct DfConfig;
+
+impl Config for DfConfig {
+    type Atomics = CoreAtomics;
+    const MIN_ALIGN: u64 = 16;
+    const LNR_FLOOR: u64 = 16;
+    const EXP_FLOOR: u64 = 256;
+    const EXP_CEIL: u64 = 4096;
+    fn heap_base() -> u64 {
+        &raw const DF_HEAP as u64
+    }
+    fn heap_size() -> u64 {
+        HEAP_N as u64
+    }
+}
+
+// Freeing an already-free block asserts in debug builds (and is a silent no-op
+// in release, which this test can't observe — hence the debug gate).
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "double free")]
+fn double_free_is_detected() {
+    let a = CadAlloc::<DfConfig>::new();
+    a.init().expect("init");
+    let s = a.alloc(100);
+    assert!(!s.is_null());
+    a.free(s);
+    a.free(s); // second free -> debug assertion
+}
+
 // --- realloc (over its own static heap) ------------------------------------
 
 #[repr(C, align(64))]
