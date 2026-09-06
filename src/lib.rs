@@ -40,10 +40,13 @@
 
 #![no_std]
 
+pub mod allocator;
 pub mod atomic;
 pub mod config;
+pub mod ffi;
 pub mod slice;
 
+pub use allocator::{Allocator, InitError, VerifyError};
 pub use atomic::Atomics;
 #[cfg(target_has_atomic = "64")]
 pub use atomic::CoreAtomics;

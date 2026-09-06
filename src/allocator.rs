@@ -207,24 +207,34 @@ impl<C: Config> Default for Allocator<C> {
 }
 
 /// Why [`Allocator::init`] could not prepare the heap.
+///
+/// `#[repr(i32)]`, so it is FFI-safe and each variant's discriminant is the
+/// status code the [`export_c_api!`](crate::export_c_api) `init` shim returns
+/// (success is `0`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(i32)]
 pub enum InitError {
     /// The heap base address is not aligned to `MIN_ALIGN`.
-    MisalignedHeap,
+    MisalignedHeap = 1,
     /// The heap is too small to hold the control region.
-    HeapTooSmall,
+    HeapTooSmall = 2,
 }
 
 /// Why [`Allocator::verify`] rejected a heap.
+///
+/// `#[repr(i32)]`, so it is FFI-safe and each variant's discriminant is the
+/// status code the [`export_c_api!`](crate::export_c_api) `verify` shim returns
+/// (success is `0`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(i32)]
 pub enum VerifyError {
     /// The `"CADALLOC"` marker is absent — the heap was never initialized (or
     /// not by `cadalloc`).
-    BadMagic,
+    BadMagic = 1,
     /// The marker is present but the configuration fingerprint differs — the
     /// heap was laid out by a different configuration. Using it would corrupt
     /// memory.
-    ConfigMismatch,
+    ConfigMismatch = 2,
 }
 
 impl<C: Config> Allocator<C> {
@@ -394,7 +404,7 @@ impl<C: Config> Allocator<C> {
     /// Must be called exactly once, from a single thread, before any
     /// allocation. Returns an [`InitError`] if the heap base is misaligned or
     /// the heap is too small to hold the control region.
-    #[inline(never)]
+    #[inline]
     pub fn init(&self) -> Result<(), InitError> {
         let base = C::heap_base();
         if base & (C::MIN_ALIGN - 1) != 0 {
@@ -426,7 +436,7 @@ impl<C: Config> Allocator<C> {
     /// a heap laid out by a different configuration corrupts memory silently,
     /// and this is the cheap guard against it. It reads only two words and does
     /// not need the lock.
-    #[inline(never)]
+    #[inline]
     pub fn verify(&self) -> Result<(), VerifyError> {
         if self.load(self.magic_addr()) != MAGIC {
             return Err(VerifyError::BadMagic);
@@ -446,7 +456,7 @@ impl<C: Config> Allocator<C> {
     /// and return the null slice. The returned slice's `len` is the block's full
     /// usable capacity, which may exceed `size`.
     #[must_use]
-    #[inline(never)]
+    #[inline]
     pub fn alloc(&self, size: u64, align: u64) -> Slice {
         if align > C::MIN_ALIGN || (align > 1 && !align.is_power_of_two()) {
             return Slice::NULL;
@@ -470,7 +480,7 @@ impl<C: Config> Allocator<C> {
     ///
     /// The slice's `ptr` must be one returned by `alloc` on this allocator; its
     /// `len` is ignored (the true size is read from the block header).
-    #[inline(never)]
+    #[inline]
     pub fn free(&self, block: Slice) {
         if block.is_null() {
             return;

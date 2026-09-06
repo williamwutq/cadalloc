@@ -1,5 +1,6 @@
-//! Unit tests for the configuration surface.
+//! Unit tests for the configuration surface and allocator core.
 
+use crate::allocator::{bin_class, bin_index};
 use crate::*;
 
 /// A representative configuration used to exercise the config surface.
@@ -62,4 +63,277 @@ fn core_atomics_round_trip() {
         assert_eq!(CoreAtomics::atomic_dec(addr), 7);
         assert_eq!(CoreAtomics::atomic_load(addr), 6);
     }
+}
+
+// --- bin-math tests (pure, parallel-safe) ----------------------------------
+
+#[test]
+fn bin_counts_are_statically_computed() {
+    // MIN_ALIGN=16, LNR_FLOOR=16, EXP_FLOOR=256, EXP_CEIL=65536:
+    // linear = (256-16)/16 = 15; exp = 2*(16-8)+1 = 17; +1 oversized = 33.
+    assert_eq!(TestConfig::NUM_LINEAR, 15);
+    assert_eq!(TestConfig::NUM_EXP, 17);
+    assert_eq!(TestConfig::NUM_BINS, 33);
+    assert_eq!(Allocator::<TestConfig>::bin_count(), 33);
+}
+
+#[test]
+fn bin_classes_are_ordered_and_aligned() {
+    let fixed = TestConfig::NUM_BINS - 1;
+    let mut prev = 0;
+    for k in 0..fixed {
+        let c = bin_class::<TestConfig>(k);
+        assert!(c > prev, "bin {k} class {c} not increasing from {prev}");
+        assert_eq!(c % TestConfig::MIN_ALIGN, 0, "bin {k} class {c} misaligned");
+        prev = c;
+    }
+    // First/last known classes.
+    assert_eq!(bin_class::<TestConfig>(0), 16);
+    assert_eq!(bin_class::<TestConfig>(14), 240);
+    assert_eq!(bin_class::<TestConfig>(15), 256);
+    assert_eq!(bin_class::<TestConfig>(16), 384);
+    assert_eq!(bin_class::<TestConfig>(fixed - 1), 65536);
+    assert_eq!(bin_class::<TestConfig>(fixed), u64::MAX); // oversized sentinel
+}
+
+#[test]
+fn bin_index_round_trips_every_class() {
+    let fixed = TestConfig::NUM_BINS - 1;
+    for k in 0..fixed {
+        let c = bin_class::<TestConfig>(k);
+        assert_eq!(
+            bin_index::<TestConfig>(c),
+            k,
+            "class {c} did not map back to bin {k}"
+        );
+    }
+}
+
+#[test]
+fn bin_index_always_fits() {
+    for s in [
+        1u64, 15, 16, 17, 100, 240, 241, 255, 256, 257, 384, 385, 512, 4096, 65535, 65536,
+    ] {
+        let k = bin_index::<TestConfig>(s);
+        assert!(
+            k < TestConfig::NUM_BINS - 1,
+            "size {s} unexpectedly oversized"
+        );
+        assert!(
+            bin_class::<TestConfig>(k) >= s,
+            "bin {k} class too small for {s}"
+        );
+    }
+    // Above EXP_CEIL is the oversized bin.
+    assert_eq!(bin_index::<TestConfig>(65537), TestConfig::NUM_BINS - 1);
+    assert_eq!(bin_index::<TestConfig>(1 << 30), TestConfig::NUM_BINS - 1);
+}
+
+// --- allocator integration test (over a real static heap) ------------------
+
+/// `"CADALLOC"` as a little-endian u64, computed independently of the crate.
+const MAGIC_LE: u64 = u64::from_le_bytes(*b"CADALLOC");
+
+const HEAP_N: usize = 1 << 16;
+
+#[repr(C, align(64))]
+struct Heap([u8; HEAP_N]);
+
+static mut HEAP: Heap = Heap([0; HEAP_N]);
+
+fn heap_base_addr() -> u64 {
+    &raw const HEAP as u64
+}
+
+/// Config backed by the static `HEAP` above, with a small `EXP_CEIL` so the
+/// oversized path is reachable within the buffer.
+struct HeapConfig;
+
+impl Config for HeapConfig {
+    type Atomics = CoreAtomics;
+
+    const MIN_ALIGN: u64 = 16;
+    const LNR_FLOOR: u64 = 16;
+    const EXP_FLOOR: u64 = 256;
+    const EXP_CEIL: u64 = 4096;
+
+    fn heap_base() -> u64 {
+        heap_base_addr()
+    }
+    fn heap_size() -> u64 {
+        HEAP_N as u64
+    }
+}
+
+/// Same heap as `HeapConfig` but a different `EXP_CEIL`, so its fingerprint
+/// differs. Only reads the fixed-offset metadata words, so it is safe to use
+/// against a `HeapConfig`-initialized heap.
+struct MismatchConfig;
+
+impl Config for MismatchConfig {
+    type Atomics = CoreAtomics;
+    const MIN_ALIGN: u64 = 16;
+    const LNR_FLOOR: u64 = 16;
+    const EXP_FLOOR: u64 = 256;
+    const EXP_CEIL: u64 = 8192; // differs from HeapConfig's 4096
+    fn heap_base() -> u64 {
+        heap_base_addr()
+    }
+    fn heap_size() -> u64 {
+        HEAP_N as u64
+    }
+}
+
+#[test]
+fn allocator_alloc_free_reuse() {
+    let a = Allocator::<HeapConfig>::new();
+
+    // A pristine (zeroed) heap has no marker.
+    assert_eq!(a.verify(), Err(VerifyError::BadMagic));
+
+    a.init().expect("init");
+
+    // After init the marker and fingerprint check out...
+    assert_eq!(a.verify(), Ok(()));
+    assert_eq!(Allocator::<HeapConfig>::magic(), MAGIC_LE);
+    // ...but a different configuration is rejected.
+    assert_eq!(
+        Allocator::<MismatchConfig>::new().verify(),
+        Err(VerifyError::ConfigMismatch)
+    );
+
+    // Basic fixed-class allocation.
+    let s1 = a.alloc(100, 16);
+    assert!(!s1.is_null());
+    assert_eq!(s1.ptr % 16, 0, "payload must be MIN_ALIGN-aligned");
+    assert!(s1.len >= 100, "capacity {} < requested 100", s1.len);
+
+    // A second allocation must not overlap the first.
+    let s2 = a.alloc(100, 16);
+    assert!(!s2.is_null());
+    assert_ne!(s1.ptr, s2.ptr);
+    assert!(
+        s2.ptr >= s1.ptr + s1.len || s1.ptr >= s2.ptr + s2.len,
+        "blocks overlap"
+    );
+
+    // Freeing then re-allocating the same class reuses the block (LIFO).
+    let p1 = s1.ptr;
+    a.free(s1);
+    let s3 = a.alloc(100, 16);
+    assert_eq!(s3.ptr, p1, "freed block should be reused");
+
+    a.free(s2);
+    a.free(s3);
+
+    // Oversized path: > EXP_CEIL (4096).
+    let big = a.alloc(5000, 16);
+    assert!(!big.is_null());
+    assert!(big.len >= 5000);
+    let bp = big.ptr;
+    a.free(big);
+    // First-fit on the oversized list should recover the same block.
+    let big2 = a.alloc(5000, 16);
+    assert_eq!(big2.ptr, bp, "oversized block should be reused");
+    a.free(big2);
+
+    // Alignment beyond MIN_ALIGN is not yet supported.
+    assert!(a.alloc(16, 32).is_null());
+}
+
+#[test]
+fn init_rejects_bad_heap() {
+    struct Misaligned;
+    impl Config for Misaligned {
+        type Atomics = CoreAtomics;
+        const MIN_ALIGN: u64 = 16;
+        const LNR_FLOOR: u64 = 16;
+        const EXP_FLOOR: u64 = 256;
+        const EXP_CEIL: u64 = 4096;
+        fn heap_base() -> u64 {
+            heap_base_addr() + 8 // deliberately off-alignment
+        }
+        fn heap_size() -> u64 {
+            HEAP_N as u64
+        }
+    }
+    assert_eq!(
+        Allocator::<Misaligned>::new().init(),
+        Err(InitError::MisalignedHeap)
+    );
+
+    struct Tiny;
+    impl Config for Tiny {
+        type Atomics = CoreAtomics;
+        const MIN_ALIGN: u64 = 16;
+        const LNR_FLOOR: u64 = 16;
+        const EXP_FLOOR: u64 = 256;
+        const EXP_CEIL: u64 = 4096;
+        fn heap_base() -> u64 {
+            heap_base_addr()
+        }
+        fn heap_size() -> u64 {
+            16 // far too small for the control region
+        }
+    }
+    assert_eq!(
+        Allocator::<Tiny>::new().init(),
+        Err(InitError::HeapTooSmall)
+    );
+}
+
+// --- FFI export shims (over their own static heap) -------------------------
+
+#[repr(C, align(64))]
+struct FfiHeap([u8; HEAP_N]);
+
+static mut FFI_HEAP: FfiHeap = FfiHeap([0; HEAP_N]);
+
+fn ffi_heap_base() -> u64 {
+    &raw const FFI_HEAP as u64
+}
+
+struct FfiConfig;
+
+impl Config for FfiConfig {
+    type Atomics = CoreAtomics;
+    const MIN_ALIGN: u64 = 16;
+    const LNR_FLOOR: u64 = 16;
+    const EXP_FLOOR: u64 = 256;
+    const EXP_CEIL: u64 = 4096;
+    fn heap_base() -> u64 {
+        ffi_heap_base()
+    }
+    fn heap_size() -> u64 {
+        HEAP_N as u64
+    }
+}
+
+crate::export_c_api! {
+    config: FfiConfig,
+    init: cadtest_init,
+    alloc: cadtest_alloc,
+    free: cadtest_free,
+    verify: cadtest_verify,
+}
+
+#[test]
+fn ffi_shims_round_trip() {
+    // BadMagic before init, then the full round trip through the C entry points.
+    assert_eq!(cadtest_verify(), 1);
+    assert_eq!(cadtest_init(), 0);
+    assert_eq!(cadtest_verify(), 0);
+
+    let s = cadtest_alloc(100, 16);
+    assert!(!s.is_null());
+    assert!(s.len >= 100);
+    cadtest_free(s);
+
+    // Reuse after free (LIFO), exercising both alloc and free shims.
+    let s2 = cadtest_alloc(100, 16);
+    assert_eq!(s2.ptr, s.ptr);
+    cadtest_free(s2);
+
+    // Alignment beyond MIN_ALIGN returns the null slice.
+    assert!(cadtest_alloc(16, 32).is_null());
 }

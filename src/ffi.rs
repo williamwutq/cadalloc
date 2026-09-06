@@ -49,6 +49,34 @@
 //!
 //! This emits `cad_init`, `cad_alloc`, `cad_free`, and `cad_verify` as
 //! unmangled `extern "C"` symbols bound to `MyConfig`.
+//!
+//! # Calling convention
+//!
+//! The default calling convention is `"C"`. Add an `abi:` line (any ABI string
+//! Rust's `extern` accepts, e.g. `"system"`, `"sysv64"`, `"aapcs"`) to override
+//! it:
+//!
+//! ```
+//! # use cadalloc::{Config, CoreAtomics};
+//! # struct MyConfig;
+//! # impl Config for MyConfig {
+//! #     type Atomics = CoreAtomics;
+//! #     const MIN_ALIGN: u64 = 16;
+//! #     const LNR_FLOOR: u64 = 16;
+//! #     const EXP_FLOOR: u64 = 256;
+//! #     const EXP_CEIL: u64 = 65536;
+//! #     const HEAP_BASE: u64 = 0x2000_0000;
+//! #     const HEAP_SIZE: u64 = 1 << 20;
+//! # }
+//! cadalloc::export_c_api! {
+//!     config: MyConfig,
+//!     abi: "system",
+//!     init: cad_init,
+//!     alloc: cad_alloc,
+//!     free: cad_free,
+//!     verify: cad_verify,
+//! }
+//! ```
 
 /// Emits unmangled `extern "C"` entry points for one concrete
 /// [`Config`](crate::Config).
@@ -78,6 +106,19 @@
 /// ```
 #[macro_export]
 macro_rules! export_c_api {
+    // With an explicit calling convention (e.g. `abi: "system"`).
+    (
+        config: $config:ty,
+        abi: $abi:literal,
+        init: $init:ident,
+        alloc: $alloc:ident,
+        free: $free:ident,
+        verify: $verify:ident $(,)?
+    ) => {
+        $crate::export_c_api!(@emit $abi, $config, $init, $alloc, $free, $verify);
+    };
+
+    // Default calling convention: `"C"`.
     (
         config: $config:ty,
         init: $init:ident,
@@ -85,40 +126,42 @@ macro_rules! export_c_api {
         free: $free:ident,
         verify: $verify:ident $(,)?
     ) => {
-        /// Prepares the heap. Returns `0` on success, `1` if the heap base is
-        /// misaligned, or `2` if the heap is too small.
+        $crate::export_c_api!(@emit "C", $config, $init, $alloc, $free, $verify);
+    };
+
+    (@emit $abi:literal, $config:ty, $init:ident, $alloc:ident, $free:ident, $verify:ident) => {
+        /// Prepares the heap. Returns `0` on success, or the `InitError`
+        /// discriminant (`1` misaligned, `2` too small).
         #[unsafe(no_mangle)]
-        pub extern "C" fn $init() -> i32 {
+        pub extern $abi fn $init() -> i32 {
             match $crate::Allocator::<$config>::new().init() {
                 Ok(()) => 0,
-                Err($crate::InitError::MisalignedHeap) => 1,
-                Err($crate::InitError::HeapTooSmall) => 2,
+                Err(e) => e as i32,
             }
         }
 
         /// Allocates `size` bytes with `align` alignment. Returns the payload
         /// slice, or the null slice (zero `ptr`) on failure.
         #[unsafe(no_mangle)]
-        pub extern "C" fn $alloc(size: u64, align: u64) -> $crate::Slice {
+        pub extern $abi fn $alloc(size: u64, align: u64) -> $crate::Slice {
             $crate::Allocator::<$config>::new().alloc(size, align)
         }
 
         /// Returns a block previously handed out by the matching `alloc`.
         /// Freeing the null slice is a no-op.
         #[unsafe(no_mangle)]
-        pub extern "C" fn $free(block: $crate::Slice) {
+        pub extern $abi fn $free(block: $crate::Slice) {
             $crate::Allocator::<$config>::new().free(block)
         }
 
         /// Checks the heap marker and configuration fingerprint. Returns `0` on
-        /// success, `1` if the marker is bad/absent, or `2` on a configuration
-        /// mismatch.
+        /// success, or the `VerifyError` discriminant (`1` bad marker, `2`
+        /// configuration mismatch).
         #[unsafe(no_mangle)]
-        pub extern "C" fn $verify() -> i32 {
+        pub extern $abi fn $verify() -> i32 {
             match $crate::Allocator::<$config>::new().verify() {
                 Ok(()) => 0,
-                Err($crate::VerifyError::BadMagic) => 1,
-                Err($crate::VerifyError::ConfigMismatch) => 2,
+                Err(e) => e as i32,
             }
         }
     };
