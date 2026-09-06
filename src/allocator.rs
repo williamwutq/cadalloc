@@ -387,7 +387,7 @@ impl<C: Config> CadAlloc<C> {
     /// Pushes a block onto bin `k`'s lock-free stack. The block is private to
     /// the caller until published by the final CAS.
     #[inline]
-    fn push_fixed(&self, k: u64, block: u64) {
+    pub(crate) fn push_fixed(&self, k: u64, block: u64) {
         let head = self.bin_head(k);
         let mask = C::MIN_ALIGN - 1;
         loop {
@@ -403,7 +403,7 @@ impl<C: Config> CadAlloc<C> {
 
     /// Pops a block from bin `k`'s lock-free stack, or returns `0` if empty.
     #[inline]
-    fn pop_fixed(&self, k: u64) -> u64 {
+    pub(crate) fn pop_fixed(&self, k: u64) -> u64 {
         let head = self.bin_head(k);
         let mask = C::MIN_ALIGN - 1;
         loop {
@@ -523,7 +523,9 @@ impl<C: Config> CadAlloc<C> {
             return Slice::NULL;
         }
         let bsize = header_size(self.load(block));
-        Slice::new(block + C::MIN_ALIGN, bsize - C::MIN_ALIGN)
+        // SAFETY: `block` is a live block we just carved/popped; its payload
+        // `[block + MIN_ALIGN, block + bsize)` is owned and in-heap.
+        unsafe { Slice::new(block + C::MIN_ALIGN, bsize - C::MIN_ALIGN) }
     }
 
     /// Returns a block previously handed out by [`alloc`](CadAlloc::alloc) to
@@ -584,12 +586,14 @@ impl<C: Config> CadAlloc<C> {
             // Fits in place. Carve the excess only when it clears SPLIT_MIN;
             // otherwise avoid the lock and keep the block whole.
             if cur_size - target < C::SPLIT_MIN {
-                return Slice::new(block.ptr, cur_size - C::MIN_ALIGN);
+                // SAFETY: same live payload as the incoming `block`, kept whole.
+                return unsafe { Slice::new(block.ptr, cur_size - C::MIN_ALIGN) };
             }
             self.lock();
             let alloc_size = self.split_and_free_tail(hdr, cur_size, target);
             self.unlock();
-            return Slice::new(block.ptr, alloc_size - C::MIN_ALIGN);
+            // SAFETY: `block` still names a live payload, now of `alloc_size`.
+            return unsafe { Slice::new(block.ptr, alloc_size - C::MIN_ALIGN) };
         }
 
         // Grow: relocate. Allocate first so a failure leaves the original valid.

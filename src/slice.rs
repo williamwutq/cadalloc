@@ -9,9 +9,15 @@
 
 /// A contiguous region of memory, described as a base address and a length.
 ///
-/// Both fields are raw `u64`s. A `Slice` carries no provenance and enforces no
-/// invariants on its own; it is the caller's responsibility to ensure any
-/// address it dereferences is valid, aligned, and part of the managed heap.
+/// Both fields are raw `u64`s. A `Slice` carries no provenance of its own, but
+/// the rest of the crate treats it as *naming a real region of memory*:
+/// [`free`](crate::CadAlloc::free) and [`realloc`](crate::CadAlloc::realloc)
+/// read a block header just below `ptr`, and callers dereference
+/// `[ptr, ptr + len)`. That is why constructing one — [`new`](Slice::new) — is
+/// `unsafe`: a fabricated slice handed back to the allocator corrupts the heap.
+/// The slices you get from [`alloc`](crate::CadAlloc::alloc) are safe to use;
+/// you only reach for `new` to round-trip an address you already own (for
+/// example across an FFI boundary).
 ///
 /// The all-zero slice ([`Slice::NULL`]) is reserved to mean "no region", and
 /// [`is_null`](Slice::is_null) tests for it. A real allocation therefore never
@@ -31,9 +37,23 @@ impl Slice {
     pub const NULL: Slice = Slice { ptr: 0, len: 0 };
 
     /// Constructs a slice from a base address and a length.
+    ///
+    /// # Safety
+    ///
+    /// A `Slice` is understood throughout the crate as naming a real region:
+    /// handing one to [`free`](crate::CadAlloc::free) or
+    /// [`realloc`](crate::CadAlloc::realloc) reads a header just below `ptr`,
+    /// and using the region dereferences `[ptr, ptr + len)`. Constructing one
+    /// therefore asserts that `ptr` and `len` describe memory the caller
+    /// actually owns — in practice, a region previously returned by an
+    /// allocator over the same heap. Fabricating a slice and passing it to the
+    /// allocator, or dereferencing it, is undefined behaviour. Prefer the
+    /// slices handed out by [`alloc`](crate::CadAlloc::alloc); use this only to
+    /// reconstruct an address you already own (e.g. across FFI). Building the
+    /// [null slice](Slice::NULL) needs no `unsafe` — use that constant instead.
     #[must_use]
     #[inline(always)]
-    pub const fn new(ptr: u64, len: u64) -> Self {
+    pub const unsafe fn new(ptr: u64, len: u64) -> Self {
         Self { ptr, len }
     }
 

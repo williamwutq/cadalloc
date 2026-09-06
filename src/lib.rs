@@ -40,6 +40,11 @@
 
 #![no_std]
 
+// The crate is `no_std`, but its test builds (unit tests, the multithreaded
+// stress test, and the loom model check) link and use `std`.
+#[cfg(test)]
+extern crate std;
+
 pub mod allocator;
 pub mod atomic;
 pub mod config;
