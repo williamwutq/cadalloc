@@ -65,7 +65,7 @@ pub use atomic::Atomics;
 #[cfg(target_has_atomic = "64")]
 pub use atomic::CoreAtomics;
 pub use config::{Config, assert_config_valid, const_heap_base, const_heap_size};
-pub use slice::Slice;
+pub use slice::{Slice, SliceView};
 
 /// Computes the power of two `2^n` as a `u64`.
 ///

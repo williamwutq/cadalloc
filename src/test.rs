@@ -32,14 +32,98 @@ fn const_heap_accessors_read_compile_time_values() {
 #[test]
 fn slice_null_and_bounds() {
     assert!(Slice::NULL.is_null());
-    // SAFETY: a fabricated slice used only for pure address arithmetic below;
-    // its bytes are never read, written, or handed to the allocator.
-    let s = unsafe { Slice::new(0x1000, 0x100) };
+    assert!(SliceView::NULL.is_null());
+    // SAFETY: a fabricated view used only for pure address arithmetic below;
+    // its bytes are never read, written, or promoted to an owning `Slice`.
+    let s = unsafe { SliceView::new(0x1000, 0x100) };
     assert!(!s.is_null());
+    assert!(!s.is_empty());
     assert_eq!(s.end(), 0x1100);
+    assert_eq!(s.range(), 0x1000..0x1100);
     assert!(s.contains(0x1000));
     assert!(s.contains(0x10FF));
     assert!(!s.contains(0x1100));
+    assert!(s.is_aligned_to(0x1000) && !s.is_aligned_to(0x2000));
+
+    // covers / overlaps
+    let inner = s.subslice(0x40, 0x40).expect("in bounds");
+    assert_eq!((inner.ptr(), inner.len()), (0x1040, 0x40));
+    assert!(s.covers(&inner) && s.overlaps(&inner));
+    assert!(s.subslice(0x100, 1).is_none()); // out of bounds
+    // SAFETY: 0x80 + 0x80 == 0x100 == len.
+    let tail = unsafe { s.subslice_unchecked(0x80, 0x80) };
+    assert!(!inner.overlaps(&tail));
+    let (head, rest) = s.split_at(0x80).expect("in bounds");
+    assert_eq!(head.len(), 0x80);
+    assert_eq!(rest.ptr(), 0x1080);
+    assert!(s.split_at(0x101).is_none());
+
+    // Ord makes views sortable (by ptr, then len).
+    let mut v = [
+        unsafe { SliceView::new(30, 1) },
+        unsafe { SliceView::new(10, 5) },
+        unsafe { SliceView::new(10, 1) },
+    ];
+    v.sort();
+    assert_eq!(
+        v,
+        [
+            unsafe { SliceView::new(10, 1) },
+            unsafe { SliceView::new(10, 5) },
+            unsafe { SliceView::new(30, 1) },
+        ]
+    );
+
+    // Debug renders the address in hex.
+    assert_eq!(std::format!("{s:?}"), "SliceView { ptr: 0x1000, len: 256 }");
+}
+
+#[test]
+fn slice_view_reads_and_writes_memory() {
+    let mut buf = [0u8; 64];
+    let base = buf.as_mut_ptr() as u64;
+    // SAFETY: `base` names this live 64-byte stack buffer.
+    let s = unsafe { SliceView::new(base, 64) };
+    assert_eq!(s.as_ptr() as u64, base);
+
+    // Write through a sub-view, read it back, and confirm it landed in `buf`.
+    let mid = s.subslice(16, 32).unwrap();
+    // SAFETY: `mid` is a live, uniquely-borrowed 32-byte region of `buf`.
+    unsafe {
+        for (i, b) in mid.as_bytes_mut().iter_mut().enumerate() {
+            *b = i as u8;
+        }
+    }
+    // SAFETY: same region, read-only, no concurrent writer.
+    unsafe {
+        let bytes = mid.as_bytes();
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[5], 5);
+    }
+    assert_eq!(buf[16 + 5], 5);
+}
+
+#[test]
+fn slice_owns_and_converts_to_view() {
+    // SAFETY: a fabricated handle used only for conversions/arithmetic below;
+    // it is never freed.
+    let owner = unsafe { Slice::new(0x2000, 0x80) };
+
+    // The handle's own inspection methods.
+    assert_eq!(owner.end(), 0x2080);
+    assert!(owner.contains(0x2000));
+
+    // A borrowing view (tied to `owner`) leaves the handle intact.
+    let v = owner.view();
+    assert_eq!(v.ptr(), owner.ptr());
+    assert_eq!(v.len(), owner.len());
+
+    // Consuming conversions, and the unsafe view -> owner round trip.
+    let back = owner.into_view(); // SliceView<'static>
+    // SAFETY: `back` still names the same (fabricated) region.
+    let owner2 = unsafe { back.to_slice() };
+    assert_eq!(owner2.len(), 0x80);
+    let _: SliceView<'static> = SliceView::from(owner2);
 }
 
 #[test]
@@ -408,12 +492,13 @@ fn ffi_shims_round_trip() {
 
     let s = cadtest_alloc(100);
     assert!(!s.is_null());
-    assert!(s.len >= 100);
+    assert!(s.len() >= 100);
+    let sp = s.ptr(); // save before the handle is consumed by free
     cadtest_free(s);
 
     // Reuse after free (LIFO), exercising both alloc and free shims.
     let s2 = cadtest_alloc(100);
-    assert_eq!(s2.ptr, s.ptr);
+    assert_eq!(s2.ptr(), sp);
 
     // realloc shim: grow, then free through the shim.
     let s3 = cadtest_realloc(s2, 2000);
@@ -450,8 +535,11 @@ impl Config for DfConfig {
     }
 }
 
-// Freeing an already-free block asserts in debug builds (and is a silent no-op
-// in release, which this test can't observe — hence the debug gate).
+// The move-only `Slice` makes an honest double free a *compile* error (the
+// handle is consumed by the first `free`). The runtime guard still matters for
+// the unsafe/FFI path, where a second owner can be fabricated — that is what we
+// exercise here. It asserts in debug builds (a silent no-op in release, which
+// this test can't observe — hence the debug gate).
 #[test]
 #[cfg(debug_assertions)]
 #[should_panic(expected = "double free")]
@@ -460,8 +548,11 @@ fn double_free_is_detected() {
     a.init().expect("init");
     let s = a.alloc(100);
     assert!(!s.is_null());
+    // SAFETY (test-only): fabricate a second handle to the same block, as an FFI
+    // caller could, to reach the runtime double-free guard.
+    let dup = unsafe { Slice::new(s.ptr(), s.len()) };
     a.free(s);
-    a.free(s); // second free -> debug assertion
+    a.free(dup); // second free -> debug assertion
 }
 
 // --- realloc (over its own static heap) ------------------------------------
@@ -524,23 +615,24 @@ fn realloc_grows_shrinks_relocates() {
     // Shrink within the fixed classes stays in place (default SPLIT_MIN keeps
     // the leftover as internal slack).
     let f = a.alloc(2000);
-    let cap = f.len;
+    let (fp, cap) = (f.ptr(), f.len());
     let t = a.realloc(f, 100);
-    assert_eq!(t.ptr, f.ptr, "fixed shrink should not move");
-    assert_eq!(t.len, cap, "fixed shrink keeps the whole block");
+    assert_eq!(t.ptr(), fp, "fixed shrink should not move");
+    assert_eq!(t.len(), cap, "fixed shrink keeps the whole block");
     a.free(t);
 
     // Oversized shrink stays in place and shrinks; a follow-up allocation is
     // valid and disjoint from the retained block.
     let big = a.alloc(12000);
-    assert!(big.len >= 12000);
+    let (bp, bl) = (big.ptr(), big.len());
+    assert!(bl >= 12000);
     let sh = a.realloc(big, 5000);
-    assert_eq!(sh.ptr, big.ptr, "oversized shrink stays in place");
-    assert!(sh.len >= 5000 && sh.len < big.len, "block actually shrank");
+    assert_eq!(sh.ptr(), bp, "oversized shrink stays in place");
+    assert!(sh.len() >= 5000 && sh.len() < bl, "block actually shrank");
     let other = a.alloc(3000);
     assert!(!other.is_null());
     assert!(
-        !overlap(sh, other),
+        !overlap(sh.view(), other.view()),
         "new allocation overlaps the retained block"
     );
     a.free(other);
@@ -582,8 +674,8 @@ impl Config for CarveConfig {
 const _: () = assert_config_valid::<CarveConfig>();
 
 /// Returns `true` if the payloads `[ptr, ptr+len)` of `a` and `b` overlap.
-fn overlap(a: Slice, b: Slice) -> bool {
-    a.ptr < b.ptr + b.len && b.ptr < a.ptr + a.len
+fn overlap(a: SliceView<'_>, b: SliceView<'_>) -> bool {
+    a.overlaps(&b)
 }
 
 // Larger than the shared HEAP_N so several oversized (> EXP_CEIL = 65536)
@@ -661,9 +753,10 @@ fn fixed_range_carve_is_non_overlapping() {
     // fixed-range excess, which is carved into class-exact free blocks.
     let big = a.alloc(4080);
     assert!(!big.is_null());
+    let bp = big.ptr();
     let small = a.realloc(big, 100);
-    assert_eq!(small.ptr, big.ptr, "shrink stays in place");
-    assert!(small.len >= 100 && small.len < 4080, "block shrank");
+    assert_eq!(small.ptr(), bp, "shrink stays in place");
+    assert!(small.len() >= 100 && small.len() < 4080, "block shrank");
 
     // Allocate a spread of sizes: some reuse the carved pieces, some bump. None
     // may overlap the retained block or each other, and all must be MIN_ALIGN
@@ -676,10 +769,13 @@ fn fixed_range_carve_is_non_overlapping() {
         let sz = 16 + (k as u64 % 6) * 130;
         let s = a.alloc(sz);
         assert!(!s.is_null(), "alloc {k} failed");
-        assert_eq!(s.ptr % 16, 0, "payload misaligned");
-        assert!(s.ptr >= heap_lo && s.ptr + s.len <= heap_hi, "out of heap");
+        assert_eq!(s.ptr() % 16, 0, "payload misaligned");
+        assert!(s.ptr() >= heap_lo && s.end() <= heap_hi, "out of heap");
         for prev in &live[..k] {
-            assert!(!overlap(s, *prev), "allocation {k} overlaps an earlier one");
+            assert!(
+                !overlap(s.view(), prev.view()),
+                "allocation {k} overlaps an earlier one"
+            );
         }
         live[k] = s;
     }
@@ -747,12 +843,13 @@ fn realloc_shrink_retains_class_exact_aligned_block() {
     for &sz in &[9_000u64, 10_000, 12_016, 16_000, 20_000, 30_000, 50_000] {
         let big = a.alloc(sz);
         assert!(!big.is_null(), "alloc {sz} failed");
+        let bp = big.ptr();
 
         let s = a.realloc(big, 200);
-        assert_eq!(s.ptr, big.ptr, "oversized shrink should stay in place");
+        assert_eq!(s.ptr(), bp, "oversized shrink should stay in place");
 
-        let block = s.ptr - C::MIN_ALIGN;
-        let class = s.len + C::MIN_ALIGN; // retained block's stamped size
+        let block = s.ptr() - C::MIN_ALIGN;
+        let class = s.len() + C::MIN_ALIGN; // retained block's stamped size
         assert!(
             is_class_exact(class),
             "retained size {class} (from {sz}) is not class-exact"
@@ -897,28 +994,29 @@ mod stress {
 
     /// Payloads are class-exact multiples of `MIN_ALIGN`, so `len` is a whole
     /// number of `u64` words. Fill every word with `token`.
-    fn fill(s: Slice, token: u64) {
-        let words = (s.len / 8) as usize;
-        let p = s.ptr as *mut u64;
+    fn fill(s: SliceView<'_>, token: u64) {
+        let words = (s.len() / 8) as usize;
+        let p = s.as_mut_ptr() as *mut u64;
         for i in 0..words {
-            // SAFETY: `s` is a live payload owned by this thread; no other thread
-            // can touch these bytes until we free it. Volatile to defeat elision.
+            // SAFETY: `s` views a live payload owned by this thread; no other
+            // thread can touch these bytes until we free it. Volatile defeats
+            // elision.
             unsafe { p.add(i).write_volatile(token) };
         }
     }
 
     /// Verifies the first `words` u64s of `s` all equal `token`.
-    fn check_prefix(s: Slice, token: u64, words: usize) {
-        let p = s.ptr as *const u64;
+    fn check_prefix(s: SliceView<'_>, token: u64, words: usize) {
+        let p = s.as_ptr() as *const u64;
         for i in 0..words {
             // SAFETY: as `fill`; reading our own live payload.
             let v = unsafe { p.add(i).read_volatile() };
-            assert_eq!(v, token, "corruption at word {i} of {:#x}", s.ptr);
+            assert_eq!(v, token, "corruption at word {i} of {:#x}", s.ptr());
         }
     }
 
-    fn check(s: Slice, token: u64) {
-        check_prefix(s, token, (s.len / 8) as usize);
+    fn check(s: SliceView<'_>, token: u64) {
+        check_prefix(s, token, (s.len() / 8) as usize);
     }
 
     #[test]
@@ -954,42 +1052,52 @@ mod stress {
                         let size = 8 + next() % 12_000;
                         let s = a.alloc(size);
                         if !s.is_null() {
-                            assert_eq!(s.ptr % 16, 0, "payload misaligned");
-                            assert!(s.len + 16 >= size + 16 || s.len >= size);
+                            assert_eq!(s.ptr() % 16, 0, "payload misaligned");
+                            assert!(s.len() >= size);
                             let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
-                            fill(s, token);
+                            fill(s.view(), token);
                             live.push((s, token));
                         }
                     } else if roll < 80 {
                         // Free a random live block, verifying it first.
                         let i = (next() as usize) % live.len();
                         let (s, token) = live.swap_remove(i);
-                        check(s, token);
+                        check(s.view(), token);
                         a.free(s);
                     } else {
                         // Reallocate a random live block; the retained prefix must
                         // survive the (possibly relocating) resize.
                         let i = (next() as usize) % live.len();
-                        let (s, token) = live[i];
-                        check(s, token);
+                        let (old, token) = live.swap_remove(i);
+                        check(old.view(), token);
+                        // Remember the region as raw values: the handle is about
+                        // to move into `realloc`, so a borrowing view of it can't
+                        // survive the call (the lifetime enforces that).
+                        let (op, ol) = (old.ptr(), old.len());
                         let new_size = 8 + next() % 12_000;
-                        let g = a.realloc(s, new_size);
+                        let g = a.realloc(old, new_size);
                         if g.is_null() {
-                            // realloc failed: the original is left valid.
-                            check(s, token);
+                            // realloc failed: the region is untouched and still
+                            // ours, but the move-only handle was consumed —
+                            // reclaim it and keep tracking the block.
+                            // SAFETY (test-only): `op`/`ol` still name that live
+                            // allocation.
+                            let restored = unsafe { Slice::new(op, ol) };
+                            check(restored.view(), token);
+                            live.push((restored, token));
                         } else {
-                            let kept = core::cmp::min(s.len, g.len);
-                            check_prefix(g, token, (kept / 8) as usize);
+                            let kept = core::cmp::min(ol, g.len());
+                            check_prefix(g.view(), token, (kept / 8) as usize);
                             let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
-                            fill(g, token);
-                            live[i] = (g, token);
+                            fill(g.view(), token);
+                            live.push((g, token));
                         }
                     }
                 }
 
                 // Return everything still held so the heap ends drained.
                 for (s, token) in live {
-                    check(s, token);
+                    check(s.view(), token);
                     a.free(s);
                 }
             }));

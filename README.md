@@ -187,16 +187,32 @@ allocates — there is no lazy initialization — and only alignments up to
 `MIN_ALIGN` can be satisfied; a stronger request returns null, which the `alloc`
 crate turns into an allocation-error abort.
 
+## Two region types
+
+Following C++'s `string` / `string_view`, memory is described by two types:
+
+- **`Slice`** — an *owning handle* to an allocation, returned by `alloc` and
+  consumed by `free`/`realloc`. It is **move-only** (not `Copy`/`Clone`), so the
+  compiler rules out double frees and use-after-free through the handle: once you
+  pass a `Slice` to `free`, you cannot name it again.
+- **`SliceView<'a>`** — a cheap, `Copy` *non-owning view*, borrowed for `'a`. It
+  carries the inspection and sub-region operations (`subslice`, `split_at`,
+  `contains`, `as_bytes`, …). Borrow an owner as one with `slice.view()`; the
+  view — and any `&'a [u8]` taken from it — is tied to that borrow, so the owner
+  cannot be freed while a view of it is alive.
+
 ## Safety
 
-- **Constructing a [`Slice`] is `unsafe`.** A `Slice` names a real region; the
-  allocator reads a header just below `ptr` on `free`/`realloc`. The slices from
-  `alloc` are safe to use — you only reach for `Slice::new` to reconstruct an
-  address you already own (e.g. across FFI), and doing so asserts that it is
-  valid. Fabricating one and freeing it is undefined behaviour.
-- **Double-free detection is best-effort and debug-only.** `free` refuses a
-  block already marked free (and asserts in debug builds), but release builds do
-  not defend against every misuse.
+- **Constructing either type from a raw address is `unsafe`.** `Slice::new` /
+  `SliceView::new` assert that the address really names owned memory (and, for a
+  view, that it lives for the chosen `'a`) — you only reach for them to
+  reconstruct an address you already own, e.g. across FFI. Handles from `alloc`
+  and views from `slice.view()` need no `unsafe`.
+- **Double-free detection is best-effort and debug-only.** The move-only `Slice`
+  makes an honest double free a *compile* error; the runtime guard exists for the
+  FFI path, where a caller can fabricate a second handle. `free` refuses a block
+  already marked free (and asserts in debug builds), but release builds do not
+  defend against every misuse.
 
 ## Concurrency testing
 
